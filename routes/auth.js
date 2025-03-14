@@ -6,6 +6,7 @@ const { protect } = require("../middleware/auth");
 
 router.post(
   "/register",
+
   [
     body("name").notEmpty().withMessage("Name is required"),
     body("email").isEmail().withMessage("Please include a valid email"),

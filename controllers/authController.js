@@ -8,7 +8,8 @@ exports.register = async (req, res) => {
       return res.status(400).json({ errors: errors.array() });
     }
 
-    let user = req.user;
+    let user = await User.findOne({ email: req.body.email });
+    console.log(user);
     if (user) {
       return res.status(400).json({ message: "User already exists" });
     }
@@ -26,7 +27,7 @@ exports.register = async (req, res) => {
     res.status(201).json({
       success: true,
       token,
-      user
+      user,
     });
   } catch (err) {
     console.error(err);
