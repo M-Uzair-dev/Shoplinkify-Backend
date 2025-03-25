@@ -25,7 +25,126 @@ const userSchema = new mongoose.Schema(
       minlength: [6, "Password must be at least 6 characters"],
       select: false,
     },
-
+    selectedPlatforms: {
+      type: {
+        instagram: {
+          type: Boolean,
+          default: true,
+        },
+        facebook: {
+          type: Boolean,
+          default: true,
+        },
+        youtube: {
+          type: Boolean,
+          default: true,
+        },
+        tiktok: {
+          type: Boolean,
+          default: true,
+        },
+      },
+      default: () => ({
+        instagram: true,
+        facebook: true,
+        youtube: true,
+        tiktok: true,
+      }),
+    },
+    feedSettings: {
+      layout: {
+        type: String,
+        enum: ["Grid", "Carousel", "Masonry"],
+        default: "Grid",
+      },
+      postsCount: {
+        type: String,
+        enum: ["3", "6", "9", "12", "15"],
+        default: "6",
+      },
+    },
+    youtubePosts: {
+      type: [
+        {
+          url: String,
+          embedCode: String,
+          videoId: String,
+          thumbnailUrl: String,
+          selected: {
+            type: Boolean,
+            default: false,
+          },
+          addedAt: {
+            type: Date,
+            default: Date.now,
+          },
+        },
+      ],
+      default: [],
+    },
+    tiktokPosts: {
+      type: [
+        {
+          url: String,
+          thumbnailUrl: String,
+          caption: String,
+          videoId: String,
+          selected: {
+            type: Boolean,
+            default: false,
+          },
+          addedAt: {
+            type: Date,
+            default: Date.now,
+          },
+        },
+      ],
+      default: [],
+    },
+    instagramPosts: {
+      type: [
+        {
+          url: String,
+          imageUrl: String,
+          embedCode: String,
+          selected: {
+            type: Boolean,
+            default: false,
+          },
+          addedAt: {
+            type: Date,
+            default: Date.now,
+          },
+        },
+      ],
+      default: [],
+    },
+    facebookPosts: {
+      type: [
+        {
+          url: String,
+          imageUrl: String,
+          selected: {
+            type: Boolean,
+            default: false,
+          },
+          addedAt: {
+            type: Date,
+            default: Date.now,
+          },
+        },
+      ],
+      default: [],
+    },
+    // Legacy fields for backward compatibility
+    youtubeEmbeds: {
+      type: [String],
+      default: [],
+    },
+    tiktokEmbeds: {
+      type: [String],
+      default: [],
+    },
     createdAt: {
       type: Date,
       default: Date.now,

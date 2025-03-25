@@ -4,6 +4,7 @@ const dotenv = require("dotenv");
 const cors = require("cors");
 const authRoutes = require("./routes/auth");
 const userRoutes = require("./routes/users");
+const socialRoutes = require("./routes/social");
 
 dotenv.config();
 
@@ -19,6 +20,7 @@ mongoose
 
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
+app.use("/api/social", socialRoutes);
 
 app.use((err, req, res, next) => {
   console.error(err.stack);
