@@ -975,7 +975,7 @@ router.post("/feed/settings", protect, async (req, res) => {
     // Validate value based on setting
     if (
       setting === "layout" &&
-      !["Grid", "Carousel", "Masonry"].includes(value)
+      !["Grid", "No Gutter", "Highlight", "Slideshow"].includes(value)
     ) {
       return res.status(400).json({
         success: false,
@@ -1190,17 +1190,6 @@ router.get("/posts/all", protect, async (req, res) => {
 
     // Take only the required number of posts
     allPosts = allPosts.slice(0, postsCount);
-
-    // If we have fewer posts than required, fill with null posts
-    while (allPosts.length < postsCount) {
-      allPosts.push({
-        url: null,
-        imageUrl: null,
-        platform: null,
-        addedAt: null,
-      });
-    }
-    console.log("ALL POSTS : ", allPosts);
 
     return res.status(200).json({
       success: true,

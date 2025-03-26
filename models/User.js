@@ -54,7 +54,7 @@ const userSchema = new mongoose.Schema(
     feedSettings: {
       layout: {
         type: String,
-        enum: ["Grid", "Carousel", "Masonry"],
+        enum: ["Grid", "No Gutter", "Highlight", "Slideshow"],
         default: "Grid",
       },
       postsCount: {
