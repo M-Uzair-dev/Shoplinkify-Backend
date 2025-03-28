@@ -70,6 +70,11 @@ const userSchema = new mongoose.Schema(
           embedCode: String,
           videoId: String,
           thumbnailUrl: String,
+          title: String,
+          channelName: String,
+          channelImage: String,
+          description: String,
+          productLink: String,
           selected: {
             type: Boolean,
             default: false,
@@ -89,6 +94,12 @@ const userSchema = new mongoose.Schema(
           thumbnailUrl: String,
           caption: String,
           videoId: String,
+          username: String,
+          userImage: String,
+          videoPath: String,
+          title: String,
+          description: String,
+          productLink: String,
           selected: {
             type: Boolean,
             default: false,
@@ -107,6 +118,9 @@ const userSchema = new mongoose.Schema(
           url: String,
           imageUrl: String,
           embedCode: String,
+          title: String,
+          description: String,
+          productLink: String,
           selected: {
             type: Boolean,
             default: false,
@@ -124,6 +138,9 @@ const userSchema = new mongoose.Schema(
         {
           url: String,
           imageUrl: String,
+          title: String,
+          description: String,
+          productLink: String,
           selected: {
             type: Boolean,
             default: false,

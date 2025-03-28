@@ -6,6 +6,65 @@ const { URL } = require("url");
 const cheerio = require("cheerio");
 const { protect } = require("../middleware/auth");
 
+router.get("/post/details", protect, async (req, res) => {
+  try {
+    const { url, platform } = req.query;
+
+    if (!url || !platform) {
+      return res.status(400).json({
+        success: false,
+        message: "URL and platform are required in the query parameters",
+      });
+    }
+
+    if (!["youtube", "tiktok", "instagram", "facebook"].includes(platform)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Invalid platform. Must be youtube, tiktok, instagram, or facebook",
+      });
+    }
+
+    const user = req.user;
+    let post = null;
+
+    // Find the post based on platform
+    switch (platform) {
+      case "youtube":
+        post = user.youtubePosts.find((post) => post.url === url);
+        break;
+      case "tiktok":
+        post = user.tiktokPosts.find((post) => post.url === url);
+        break;
+      case "instagram":
+        post = user.instagramPosts.find((post) => post.url === url);
+        break;
+      case "facebook":
+        post = user.facebookPosts.find((post) => post.url === url);
+        break;
+    }
+
+    if (!post) {
+      return res.status(404).json({
+        success: false,
+        message: "Post not found",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: post,
+    });
+  } catch (error) {
+    console.error("Error fetching post details:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error fetching post details",
+      error: error.message,
+    });
+  }
+});
+
 router.post("/youtube", protect, async (req, res) => {
   try {
     const { url } = req.body;
@@ -52,27 +111,96 @@ router.post("/youtube", protect, async (req, res) => {
       });
     }
 
-    // Create a standard YouTube URL
-    const standardUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    const thumbnailUrl = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
+    // Get YouTube API key from environment variables
+    const apiKey = process.env.YOUTUBE_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({
+        success: false,
+        message: "YouTube API key is not configured",
+      });
+    }
 
-    // Save to user's profile
-    req.user.youtubePosts.push({
-      url: standardUrl,
-      videoId: videoId,
-      thumbnailUrl: thumbnailUrl,
-      addedAt: new Date(),
-    });
-    await req.user.save();
+    try {
+      // Fetch video details
+      const videoApiUrl = `https://www.googleapis.com/youtube/v3/videos?id=${videoId}&key=${apiKey}&part=snippet`;
+      console.log("Fetching video details from:", videoApiUrl);
+      const videoResponse = await axios.get(videoApiUrl);
+      const videoData = videoResponse.data;
 
-    return res.status(200).json({
-      success: true,
-      platform: "youtube",
-      url: standardUrl,
-      videoId: videoId,
-      thumbnailUrl: thumbnailUrl,
-      message: "YouTube video added successfully",
-    });
+      if (!videoData.items || videoData.items.length === 0) {
+        throw new Error("Could not fetch video metadata!");
+      }
+
+      const snippet = videoData.items[0].snippet;
+      const channelId = snippet.channelId;
+      const title = snippet.title;
+      const thumbnailUrl = snippet.thumbnails.high.url;
+      const channelName = snippet.channelTitle;
+
+      // Fetch channel details (for channel image)
+      const channelApiUrl = `https://www.googleapis.com/youtube/v3/channels?id=${channelId}&key=${apiKey}&part=snippet`;
+      const channelResponse = await axios.get(channelApiUrl);
+      const channelData = channelResponse.data;
+
+      if (!channelData.items || channelData.items.length === 0) {
+        throw new Error("Could not fetch channel data!");
+      }
+
+      const channelImage = channelData.items[0].snippet.thumbnails.default.url;
+
+      // Create embed HTML
+      const embedCode = `<iframe width="560" height="315" src="https://www.youtube.com/embed/${videoId}" frameborder="0" allowfullscreen></iframe>`;
+
+      console.log("Successfully fetched YouTube data:", {
+        videoId,
+        title,
+        thumbnailUrl,
+        channelName,
+        channelImage,
+      });
+
+      // Save to user's profile
+      req.user.youtubePosts.push({
+        url: normalizedUrl,
+        videoId: videoId,
+        thumbnailUrl: thumbnailUrl,
+        title: title,
+        channelName: channelName,
+        channelImage: channelImage,
+        description: snippet.description || "",
+        embedCode: embedCode,
+        addedAt: new Date(),
+      });
+      await req.user.save();
+
+      return res.status(200).json({
+        success: true,
+        platform: "youtube",
+        url: normalizedUrl,
+        videoId: videoId,
+        thumbnailUrl: thumbnailUrl,
+        title: title,
+        channelName: channelName,
+        channelImage: channelImage,
+        description: snippet.description || "",
+        embedCode: embedCode,
+        message: "YouTube video added successfully",
+      });
+    } catch (error) {
+      console.error("YouTube API error:", error.message);
+      if (error.response && error.response.data) {
+        console.error(
+          "YouTube API error details:",
+          JSON.stringify(error.response.data, null, 2)
+        );
+      }
+      return res.status(500).json({
+        success: false,
+        message: "Error fetching YouTube data",
+        error: error.message,
+        details: error.response?.data,
+      });
+    }
   } catch (error) {
     console.error("YouTube processing error:", error);
     return res.status(500).json({
@@ -396,6 +524,8 @@ router.post("/instagram", protect, async (req, res) => {
         url: originalPostUrl,
         imageUrl: imageUrl,
         embedCode: originalEmbedCode,
+        title: "",
+        description: "",
         addedAt: new Date(),
       });
       await req.user.save();
@@ -614,6 +744,8 @@ router.post("/facebook", protect, async (req, res) => {
       req.user.facebookPosts.push({
         url: postUrl,
         imageUrl: imageUrl,
+        title: "",
+        description: "",
         addedAt: new Date(),
       });
       await req.user.save();
@@ -644,7 +776,6 @@ router.post("/facebook", protect, async (req, res) => {
     });
   }
 });
-
 // TikTok video details endpoint
 router.post("/tiktok", protect, async (req, res) => {
   try {
@@ -685,19 +816,32 @@ router.post("/tiktok", protect, async (req, res) => {
 
       // Simple validation matching the HTML example
       if (response.data && response.data.data) {
-        const thumbnailUrl = response.data.data.cover || "";
+        const thumbnailUrl = response.data.data.origin_cover || "";
         const caption = response.data.data.title || "";
         const videoId = response.data.data.id || "";
+        const username = response.data.data.author?.unique_id || "";
+        const userImage = response.data.data.author?.avatar || "";
+        const videoPath = response.data.data.wmplay || "";
 
-        console.log("Successfully extracted TikTok thumbnail:", thumbnailUrl);
-        console.log("Caption:", caption);
+        console.log("Successfully extracted TikTok data:", {
+          thumbnailUrl,
+          caption,
+          username,
+          userImage,
+          videoPath,
+        });
 
-        // Save to user's profile
+        // Save to user's profile with additional fields
         req.user.tiktokPosts.push({
           url: videoUrl,
           thumbnailUrl: thumbnailUrl,
           caption: caption,
           videoId: videoId,
+          username: username,
+          userImage: userImage,
+          videoPath: videoPath,
+          title: caption || "",
+          description: "",
           addedAt: new Date(),
         });
 
@@ -708,8 +852,11 @@ router.post("/tiktok", protect, async (req, res) => {
           platform: "tiktok",
           url: videoUrl,
           thumbnailUrl: thumbnailUrl,
-          caption: caption,
+          title: caption,
           videoId: videoId,
+          username: username,
+          userImage: userImage,
+          videoPath: videoPath,
           extractionMethod: "tikwm_api_simplified",
           message: "TikTok video added successfully",
         });
@@ -746,7 +893,7 @@ router.post("/tiktok", protect, async (req, res) => {
             thumbnailUrl
           );
 
-          // Save to user's profile
+          // Save to user's profile with minimal data
           req.user.tiktokPosts.push({
             url: videoUrl,
             thumbnailUrl: thumbnailUrl,
@@ -1584,6 +1731,135 @@ router.get("/selected", protect, async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Error fetching all selected posts",
+      error: error.message,
+    });
+  }
+});
+
+// Add a new route to update post details
+router.post("/post/update-details", protect, async (req, res) => {
+  try {
+    const { url, platform, title, description, productLink } = req.body;
+
+    if (!url || !platform) {
+      return res.status(400).json({
+        success: false,
+        message: "URL and platform are required",
+      });
+    }
+
+    const user = req.user;
+    let updated = false;
+    let post = null;
+
+    switch (platform) {
+      case "youtube":
+        {
+          const postIndex = user.youtubePosts.findIndex(
+            (post) => post.url === url
+          );
+          if (postIndex !== -1) {
+            // Only update the fields that are provided
+            if (title !== undefined) {
+              user.youtubePosts[postIndex].title = title;
+            }
+            if (description !== undefined) {
+              user.youtubePosts[postIndex].description = description;
+            }
+            if (productLink !== undefined) {
+              user.youtubePosts[postIndex].productLink = productLink;
+            }
+            post = user.youtubePosts[postIndex];
+            updated = true;
+          }
+        }
+        break;
+
+      case "tiktok":
+        {
+          const postIndex = user.tiktokPosts.findIndex(
+            (post) => post.url === url
+          );
+          if (postIndex !== -1) {
+            // Only update the fields that are provided
+            if (title !== undefined) {
+              user.tiktokPosts[postIndex].title = title;
+            }
+            if (description !== undefined) {
+              user.tiktokPosts[postIndex].description = description;
+            }
+            if (productLink !== undefined) {
+              user.tiktokPosts[postIndex].productLink = productLink;
+            }
+            post = user.tiktokPosts[postIndex];
+            updated = true;
+          }
+        }
+        break;
+
+      case "instagram":
+        {
+          const postIndex = user.instagramPosts.findIndex(
+            (post) => post.url === url
+          );
+          if (postIndex !== -1) {
+            // Only update the fields that are provided
+            if (title !== undefined) {
+              user.instagramPosts[postIndex].title = title;
+            }
+            if (description !== undefined) {
+              user.instagramPosts[postIndex].description = description;
+            }
+            if (productLink !== undefined) {
+              user.instagramPosts[postIndex].productLink = productLink;
+            }
+            post = user.instagramPosts[postIndex];
+            updated = true;
+          }
+        }
+        break;
+
+      case "facebook":
+        {
+          const postIndex = user.facebookPosts.findIndex(
+            (post) => post.url === url
+          );
+          if (postIndex !== -1) {
+            // Only update the fields that are provided
+            if (title !== undefined) {
+              user.facebookPosts[postIndex].title = title;
+            }
+            if (description !== undefined) {
+              user.facebookPosts[postIndex].description = description;
+            }
+            if (productLink !== undefined) {
+              user.facebookPosts[postIndex].productLink = productLink;
+            }
+            post = user.facebookPosts[postIndex];
+            updated = true;
+          }
+        }
+        break;
+    }
+
+    if (updated) {
+      await user.save();
+      return res.status(200).json({
+        success: true,
+        message: "Post details updated successfully",
+        data: post,
+      });
+    } else {
+      return res.status(404).json({
+        success: false,
+        message: "Post not found",
+      });
+    }
+  } catch (error) {
+    console.error("Error updating post details:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error updating post details",
       error: error.message,
     });
   }
