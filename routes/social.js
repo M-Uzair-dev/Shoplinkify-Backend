@@ -5,6 +5,7 @@ const axios = require("axios");
 const { URL } = require("url");
 const cheerio = require("cheerio");
 const { protect } = require("../middleware/auth");
+const proxyService = require("../utils/proxyService");
 
 router.get("/post/details", protect, async (req, res) => {
   try {
@@ -558,224 +559,158 @@ router.post("/instagram", protect, async (req, res) => {
 });
 
 // Facebook post details endpoint
-router.post("/facebook", protect, async (req, res) => {
+router.get("/facebook/post-details", async (req, res) => {
   try {
-    const { url: postUrl } = req.body;
+    const { url } = req.query;
 
-    if (!postUrl) {
-      return res.status(400).json({
-        success: false,
-        message: "Post URL is required in the request body",
-      });
+    if (!url) {
+      return res.status(400).json({ error: "URL is required" });
     }
 
-    // Update regex to accept newer Facebook URL formats including share/p/ links
-    if (
-      !/^https?:\/\/(www\.)?(facebook|fb)\.com\/[a-zA-Z0-9.]+\/posts\/|^https?:\/\/(www\.)?(facebook|fb)\.com\/[a-zA-Z0-9.]+\/photos\/|^https?:\/\/(www\.)?(facebook|fb)\.com\/share\/p\/[a-zA-Z0-9_-]+\/|^https?:\/\/(www\.)?(facebook|fb)\.com\/share\/v\/[a-zA-Z0-9_-]+\//.test(
-        postUrl
-      )
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid Facebook URL. Must be a post, photo, or share URL",
-      });
+    // Validate Facebook URL
+    const facebookUrlRegex = /^https?:\/\/(www\.)?(facebook\.com|fb\.com)\/.*$/;
+    if (!facebookUrlRegex.test(url)) {
+      return res.status(400).json({ error: "Invalid Facebook URL" });
     }
 
+    console.log("Fetching Facebook content for URL:", url);
+
+    // Enhanced request headers to mimic a real browser
+    const headers = {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept-Encoding": "gzip, deflate, br",
+      Connection: "keep-alive",
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "none",
+      "Sec-Fetch-User": "?1",
+      "Cache-Control": "max-age=0",
+    };
+
+    // Try to fetch the Facebook content using the proxy service
+    let response;
     try {
-      // Enhanced request headers to mimic a real browser more closely
-      const headers = {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        Referer: "https://www.google.com/",
-        "Cache-Control": "no-cache",
-        Pragma: "no-cache",
-        DNT: "1",
-        Connection: "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-      };
-
-      console.log("Attempting to fetch Facebook content from:", postUrl);
-      const { data } = await axios.get(postUrl, {
-        headers: headers,
+      response = await proxyService.request(url, {
+        method: "GET",
+        headers,
         timeout: 15000,
-        maxRedirects: 5,
-      });
-
-      console.log("Successfully fetched Facebook page HTML");
-      const $ = cheerio.load(data);
-
-      // First attempt: Try to get image from meta tags
-      let imageUrl = $('meta[property="og:image"]').attr("content");
-      let extractionMethod = "og_image";
-
-      // Second attempt: Try other meta tags
-      if (!imageUrl) {
-        imageUrl =
-          $('meta[property="og:image:secure_url"]').attr("content") ||
-          $('meta[property="twitter:image"]').attr("content");
-        extractionMethod = "alternative_meta";
-      }
-
-      // Third attempt: Look for image elements based on Facebook's structure
-      if (!imageUrl) {
-        // For /share/p/ URLs, try to find the image in a specific structure
-        if (postUrl.includes("/share/p/")) {
-          const possibleImages = $("img")
-            .filter(function () {
-              // Filter for images that are likely to be post content
-              const src = $(this).attr("src");
-              return (
-                src &&
-                (src.includes("fbcdn.net") ||
-                  src.includes("scontent") ||
-                  src.includes("facebook.com/safe_image.php"))
-              );
-            })
-            .map(function () {
-              return $(this).attr("src");
-            })
-            .get();
-
-          // Try to find the largest image (typically the main content)
-          if (possibleImages.length > 0) {
-            imageUrl = possibleImages[0]; // Just use the first one as default
-            for (const img of possibleImages) {
-              // Prioritize high-resolution images
-              if (img.includes("_n.") || img.includes("_o.")) {
-                imageUrl = img;
-                break;
-              }
-            }
-            extractionMethod = "html_image";
-          }
-        }
-      }
-
-      // Fourth attempt: Try to extract from JSON-LD
-      if (!imageUrl) {
-        const scripts = $('script[type="application/ld+json"]')
-          .map(function () {
-            return $(this).html();
-          })
-          .get();
-
-        for (const script of scripts) {
-          try {
-            const ldJson = JSON.parse(script);
-            if (ldJson.image) {
-              if (Array.isArray(ldJson.image)) {
-                imageUrl = ldJson.image[0];
-              } else {
-                imageUrl = ldJson.image;
-              }
-              extractionMethod = "json_ld";
-              break;
-            }
-          } catch (e) {
-            // Invalid JSON, skip this script
-          }
-        }
-      }
-
-      // If still no image, try to look for patterns in the HTML that might contain image URL
-      if (!imageUrl) {
-        // Search for image URLs in the HTML
-        const fbcdnPattern =
-          /https:\/\/[a-z0-9-]+\.fbcdn\.net\/[a-z0-9_\/.]+\.(?:jpg|jpeg|png|gif)/gi;
-        const matches = data.match(fbcdnPattern);
-        if (matches && matches.length > 0) {
-          // Use the first match (most likely to be the main image)
-          imageUrl = matches[0];
-          extractionMethod = "regex_match";
-        }
-      }
-
-      if (!imageUrl) {
-        // If a Facebook URL contains /share/p/, we can generate a default thumbnail
-        if (postUrl.includes("/share/p/")) {
-          // Extract the post ID
-          const postIdMatch = postUrl.match(/\/share\/p\/([a-zA-Z0-9_-]+)/);
-          if (postIdMatch && postIdMatch[1]) {
-            // Use a generic Facebook post image
-            imageUrl =
-              "https://static.xx.fbcdn.net/rsrc.php/v3/y4/r/-PAXP-deijE.gif";
-            extractionMethod = "fallback_share";
-          }
-        }
-      }
-
-      if (!imageUrl) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Could not find image for the Facebook post. This might be due to privacy settings or Facebook's anti-scraping measures.",
-        });
-      }
-
-      // Verify image accessibility by making a HEAD request
-      try {
-        console.log("Verifying Facebook image accessibility:", imageUrl);
-        await axios.head(imageUrl, {
-          timeout: 5000,
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
-            Referer: "https://www.facebook.com/",
-          },
-        });
-        console.log("Facebook image is accessible");
-      } catch (error) {
-        console.log(
-          "Warning: Facebook image may not be directly accessible:",
-          error.message
-        );
-        // We'll still try to use it, but we'll note the warning
-      }
-
-      console.log(`Final Facebook image (via ${extractionMethod}):`, imageUrl);
-
-      req.user.facebookPosts.push({
-        url: postUrl,
-        imageUrl: imageUrl,
-        title: "",
-        description: "",
-        addedAt: new Date(),
-      });
-      await req.user.save();
-
-      return res.status(200).json({
-        success: true,
-        platform: "facebook",
-        url: postUrl,
-        imageUrl: imageUrl,
-        extractionMethod,
-        message: "Facebook post image added successfully",
       });
     } catch (error) {
-      console.error("Facebook scraping error:", error);
-      return res.status(404).json({
-        success: false,
-        message:
-          "Error accessing Facebook post. It may be private or not publicly accessible.",
-        error: error.message,
-      });
+      console.error(
+        "Failed to fetch Facebook content through proxy:",
+        error.message
+      );
+
+      // Fall back to direct request
+      console.log("Falling back to direct request");
+      response = await axios.get(url, { headers });
     }
+
+    const html = response.data;
+
+    // Extract post details
+    const postDetails = {
+      title: "",
+      description: "",
+      imageUrl: "",
+      author: "",
+      publishedTime: "",
+      url: url,
+    };
+
+    // Extract title
+    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+    if (titleMatch) {
+      postDetails.title = titleMatch[1].trim();
+    }
+
+    // Extract description
+    const descriptionMatch = html.match(
+      /<meta[^>]*property="og:description"[^>]*content="([^"]*)"[^>]*>/i
+    );
+    if (descriptionMatch) {
+      postDetails.description = descriptionMatch[1].trim();
+    }
+
+    // Extract image URL
+    const imageMatch = html.match(
+      /<meta[^>]*property="og:image"[^>]*content="([^"]*)"[^>]*>/i
+    );
+    if (imageMatch) {
+      postDetails.imageUrl = imageMatch[1].trim();
+    }
+
+    // Extract author
+    const authorMatch = html.match(
+      /<meta[^>]*property="article:author"[^>]*content="([^"]*)"[^>]*>/i
+    );
+    if (authorMatch) {
+      postDetails.author = authorMatch[1].trim();
+    }
+
+    // Extract published time
+    const publishedTimeMatch = html.match(
+      /<meta[^>]*property="article:published_time"[^>]*content="([^"]*)"[^>]*>/i
+    );
+    if (publishedTimeMatch) {
+      postDetails.publishedTime = publishedTimeMatch[1].trim();
+    }
+
+    // Verify image accessibility
+    if (postDetails.imageUrl) {
+      try {
+        // Try to access the image through the proxy service
+        await proxyService.request(postDetails.imageUrl, {
+          method: "HEAD",
+          timeout: 5000,
+          headers: {
+            "User-Agent": headers["User-Agent"],
+            Referer: url,
+          },
+        });
+      } catch (error) {
+        console.error("Failed to access image through proxy:", error.message);
+
+        // Fall back to direct request
+        try {
+          await axios.head(postDetails.imageUrl, {
+            timeout: 5000,
+            headers: {
+              "User-Agent": headers["User-Agent"],
+              Referer: url,
+            },
+          });
+        } catch (directError) {
+          console.error(
+            "Failed to access image directly:",
+            directError.message
+          );
+
+          // Use a fallback image
+          postDetails.imageUrl =
+            "https://www.facebook.com/images/fb_icon_325x325.png";
+        }
+      }
+    } else {
+      // Use a fallback image if no image URL was found
+      postDetails.imageUrl =
+        "https://www.facebook.com/images/fb_icon_325x325.png";
+    }
+
+    console.log("Successfully fetched Facebook content:", postDetails);
+
+    res.json(postDetails);
   } catch (error) {
-    console.error("Facebook API error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Error fetching Facebook image",
-      error: error.message,
-    });
+    console.error("Error fetching Facebook content:", error);
+    res.status(500).json({ error: "Failed to fetch Facebook content" });
   }
 });
+
 // TikTok video details endpoint
 router.post("/tiktok", protect, async (req, res) => {
   try {
@@ -1122,7 +1057,17 @@ router.post("/feed/settings", protect, async (req, res) => {
     // Validate value based on setting
     if (
       setting === "layout" &&
-      !["Grid", "No Gutter", "Highlight", "Slideshow"].includes(value)
+      ![
+        "Grid",
+        "No Gutter",
+        "Highlight",
+        "Slideshow",
+        "Collage1",
+        "Collage2",
+        "Collage3",
+        "Collage4",
+        "Collage5",
+      ].includes(value)
     ) {
       return res.status(400).json({
         success: false,

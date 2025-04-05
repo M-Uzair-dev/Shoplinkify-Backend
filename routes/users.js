@@ -10,6 +10,7 @@ const {
   deleteAccount,
   getName,
   getPostCounts,
+  updateHeadings,
 } = require("../controllers/userController");
 
 // Get user's name
@@ -74,5 +75,29 @@ router.patch(
   ],
   updateUser
 );
+
+// @route   GET /api/users/headings
+// @desc    Get user's headings
+router.get("/headings", protect, async (req, res) => {
+  try {
+    const user = await req.user;
+    res.json({
+      success: true,
+      data: {
+        mainHeading: user.mainHeading,
+        subHeading: user.subHeading,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error retrieving headings",
+    });
+  }
+});
+
+// @route   POST /api/users/headings
+// @desc    Update user's headings
+router.post("/headings", protect, updateHeadings);
 
 module.exports = router;

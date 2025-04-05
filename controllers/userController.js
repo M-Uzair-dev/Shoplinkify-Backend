@@ -192,3 +192,38 @@ exports.getPostCounts = async (req, res) => {
     });
   }
 };
+
+exports.updateHeadings = async (req, res) => {
+  try {
+    const { mainHeading, subHeading } = req.body;
+    const user = req.user;
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const updateFields = {};
+    if (mainHeading !== undefined) updateFields.mainHeading = mainHeading;
+    if (subHeading !== undefined) updateFields.subHeading = subHeading;
+
+    const updatedUser = await User.findByIdAndUpdate(
+      user._id,
+      { $set: updateFields },
+      { new: true }
+    );
+
+    res.json({
+      success: true,
+      data: {
+        mainHeading: updatedUser.mainHeading,
+        subHeading: updatedUser.subHeading,
+      },
+    });
+  } catch (error) {
+    console.error("Error updating headings:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating headings",
+    });
+  }
+};

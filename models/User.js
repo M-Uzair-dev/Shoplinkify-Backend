@@ -59,7 +59,17 @@ const userSchema = new mongoose.Schema(
     feedSettings: {
       layout: {
         type: String,
-        enum: ["Grid", "No Gutter", "Highlight", "Slideshow"],
+        enum: [
+          "Grid",
+          "No Gutter",
+          "Highlight",
+          "Slideshow",
+          "Collage1",
+          "Collage2",
+          "Collage3",
+          "Collage4",
+          "Collage5",
+        ],
         default: "Grid",
       },
       postsCount: {
@@ -158,6 +168,15 @@ const userSchema = new mongoose.Schema(
       ],
       default: [],
     },
+    mainHeading: {
+      type: String,
+      default: "Enter Main heading",
+    },
+    subHeading: {
+      type: String,
+      default: "Enter Sub heading",
+    },
+
     // Legacy fields for backward compatibility
     youtubeEmbeds: {
       type: [String],
