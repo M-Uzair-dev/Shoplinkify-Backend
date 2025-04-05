@@ -160,3 +160,35 @@ exports.getName = async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 };
+
+exports.getPostCounts = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const counts = {
+      total:
+        user.youtubePosts.length +
+        user.tiktokPosts.length +
+        user.instagramPosts.length +
+        user.facebookPosts.length,
+      instagram: user.instagramPosts.length,
+      tiktok: user.tiktokPosts.length,
+      facebook: user.facebookPosts.length,
+      youtube: user.youtubePosts.length,
+    };
+
+    res.json({
+      success: true,
+      data: counts,
+    });
+  } catch (error) {
+    console.error("Error getting post counts:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error retrieving post counts",
+    });
+  }
+};

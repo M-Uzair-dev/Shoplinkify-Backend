@@ -9,10 +9,12 @@ const {
   changePassword,
   deleteAccount,
   getName,
+  getPostCounts,
 } = require("../controllers/userController");
 
 // Get user's name
 router.get("/name", protect, getName);
+router.get("/counts", protect, getPostCounts);
 
 // Update profile (name and image)
 router.patch(

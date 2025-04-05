@@ -521,7 +521,7 @@ router.post("/instagram", protect, async (req, res) => {
         : processedUrl;
 
       req.user.instagramPosts.push({
-        url: originalPostUrl,
+        url: postUrl,
         imageUrl: imageUrl,
         embedCode: originalEmbedCode,
         title: "",
@@ -533,7 +533,7 @@ router.post("/instagram", protect, async (req, res) => {
       return res.status(200).json({
         success: true,
         platform: "instagram",
-        url: originalPostUrl,
+        url: postUrl,
         imageUrl: imageUrl,
         extractionMethod: extractionMethod,
         message: "Instagram post image added successfully",
