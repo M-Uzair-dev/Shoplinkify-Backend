@@ -6,6 +6,10 @@ const axios = require("axios");
 const { URL } = require("url");
 const cheerio = require("cheerio");
 const { protect } = require("../middleware/auth");
+const Click = require("../models/click");
+const dayjs = require("dayjs");
+const isoWeek = require("dayjs/plugin/isoWeek");
+dayjs.extend(isoWeek); // Enables week-based calculations
 
 // Add these utility functions at the top of the file after the imports
 const CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
@@ -63,6 +67,65 @@ const setCachedImage = (url, imageUrl) => {
   });
 };
 
+router.get("/clicks", protect, async (req, res) => {
+  try {
+    const clicks = await Click.find({ user: req.user._id });
+    const result = {
+      instagram: [],
+      facebook: [],
+      youtube: [],
+      tiktok: [],
+    };
+
+    // Helper object to organize data before formatting
+    const grouped = {
+      instagram: {},
+      facebook: {},
+      youtube: {},
+      tiktok: {},
+    };
+
+    // Group clicks by platform and then by week
+    clicks.forEach((click) => {
+      const { platform, date } = click;
+      const weekStart = dayjs(date).startOf("isoWeek").format("YYYY-MM-DD");
+
+      if (!grouped[platform]) grouped[platform] = {};
+      if (!grouped[platform][weekStart]) grouped[platform][weekStart] = 0;
+
+      grouped[platform][weekStart]++;
+    });
+
+    // Transform grouped data into desired array format
+    Object.keys(grouped).forEach((platform) => {
+      const weeks = grouped[platform];
+      const weeklyClicks = [];
+
+      Object.keys(weeks)
+        .sort() // sort weeks chronologically
+        .forEach((weekStart) => {
+          weeklyClicks.push({
+            weekStart,
+            clicks: weeks[weekStart],
+          });
+        });
+
+      result[platform] = weeklyClicks;
+    });
+
+    res.json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    console.error("Error organizing clicks:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error while processing clicks",
+    });
+  }
+});
+
 router.get("/post/details", protect, async (req, res) => {
   try {
     const { url, platform } = req.query;
@@ -97,6 +160,13 @@ router.get("/post/details", protect, async (req, res) => {
         message: "Post not found",
       });
     }
+
+    await Click.create({
+      user: req.user._id,
+      post: post._id,
+      country: req.query.country,
+      platform: platform,
+    });
 
     res.json({
       success: true,
@@ -601,53 +671,21 @@ router.post("/instagram", protect, async (req, res) => {
   }
 });
 
-// Replace the Facebook image extraction section with this enhanced version
-router.post("/facebook", protect, async (req, res) => {
+// Helper function to extract Facebook image URL
+const extractFacebookImageUrl = async (url) => {
   try {
-    const { url: postUrl } = req.body;
+    console.log("Extracting Facebook image from URL:", url);
 
-    if (!postUrl) {
-      return res.status(400).json({
-        success: false,
-        message: "Post URL is required in the request body",
-      });
-    }
-
-    // Check cache first
-    const cachedImageUrl = getCachedImage(postUrl);
-    if (cachedImageUrl) {
-      console.log("Using cached Facebook image:", cachedImageUrl);
-      return res.status(200).json({
-        success: true,
-        platform: "facebook",
-        url: postUrl,
-        imageUrl: cachedImageUrl,
-        extractionMethod: "cache",
-        message: "Facebook post image retrieved from cache",
-      });
-    }
-
-    // Validate URL format
-    if (
-      !/^https?:\/\/(www\.)?(facebook|fb)\.com\/[a-zA-Z0-9.]+\/posts\/|^https?:\/\/(www\.)?(facebook|fb)\.com\/[a-zA-Z0-9.]+\/photos\/|^https?:\/\/(www\.)?(facebook|fb)\.com\/share\/p\/[a-zA-Z0-9_-]+\/|^https?:\/\/(www\.)?(facebook|fb)\.com\/share\/v\/[a-zA-Z0-9_-]+\//.test(
-        postUrl
-      )
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid Facebook URL. Must be a post, photo, or share URL",
-      });
-    }
-
-    try {
-      // Enhanced request headers
-      const headers = {
+    // First try to get the image from the Open Graph meta tags
+    const response = await axios({
+      method: "get",
+      url: url,
+      headers: {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         Accept:
           "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        Referer: "https://www.google.com/",
+        "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "no-cache",
         Pragma: "no-cache",
         DNT: "1",
@@ -657,171 +695,142 @@ router.post("/facebook", protect, async (req, res) => {
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "none",
         "Sec-Fetch-User": "?1",
-      };
+      },
+      timeout: 10000,
+      maxRedirects: 5,
+    });
 
-      // Fetch Facebook content with retry
-      const { data } = await retryWithBackoff(async () => {
-        console.log("Attempting to fetch Facebook content from:", postUrl);
-        return await axios.get(postUrl, {
-          headers,
-          timeout: 15000,
-          maxRedirects: 5,
-        });
-      });
+    const html = response.data;
 
-      console.log("Successfully fetched Facebook page HTML");
-      const $ = cheerio.load(data);
+    // Try to extract image from Open Graph meta tags
+    const ogImageMatch = html.match(
+      /<meta[^>]*property="og:image"[^>]*content="([^"]*)"[^>]*>/i
+    );
+    if (ogImageMatch && ogImageMatch[1]) {
+      console.log("Found Facebook image from OG meta tag:", ogImageMatch[1]);
+      return ogImageMatch[1];
+    }
 
-      // Enhanced image extraction with multiple methods
-      let imageUrl = null;
-      let extractionMethod = "";
+    // Try to extract image from Twitter card meta tags
+    const twitterImageMatch = html.match(
+      /<meta[^>]*name="twitter:image"[^>]*content="([^"]*)"[^>]*>/i
+    );
+    if (twitterImageMatch && twitterImageMatch[1]) {
+      console.log(
+        "Found Facebook image from Twitter meta tag:",
+        twitterImageMatch[1]
+      );
+      return twitterImageMatch[1];
+    }
 
-      // Method 1: Meta tags
-      imageUrl =
-        $('meta[property="og:image"]').attr("content") ||
-        $('meta[property="og:image:secure_url"]').attr("content") ||
-        $('meta[property="twitter:image"]').attr("content");
-      extractionMethod = "meta_tags";
+    // Try to extract image from structured data
+    const structuredDataMatch = html.match(/"image":\s*"([^"]+)"/i);
+    if (structuredDataMatch && structuredDataMatch[1]) {
+      console.log(
+        "Found Facebook image from structured data:",
+        structuredDataMatch[1]
+      );
+      return structuredDataMatch[1];
+    }
 
-      // Method 2: Structured data
-      if (!imageUrl) {
-        const scripts = $('script[type="application/ld+json"]')
-          .map(function () {
-            return $(this).html();
-          })
-          .get();
+    // Try to extract image from img tags with specific classes or IDs
+    const imgTagMatches =
+      html.match(
+        /<img[^>]*class="[^"]*scaledImage[^"]*"[^>]*src="([^"]*)"[^>]*>/i
+      ) ||
+      html.match(/<img[^>]*id="[^"]*fbImage[^"]*"[^>]*src="([^"]*)"[^>]*>/i) ||
+      html.match(/<img[^>]*data-src="([^"]*)"[^>]*>/i);
 
-        for (const script of scripts) {
-          try {
-            const ldJson = JSON.parse(script);
-            if (ldJson.image) {
-              imageUrl = Array.isArray(ldJson.image)
-                ? ldJson.image[0]
-                : ldJson.image;
-              extractionMethod = "structured_data";
-              break;
-            }
-          } catch (e) {
-            // Skip invalid JSON
-          }
-        }
-      }
+    if (imgTagMatches && imgTagMatches[1]) {
+      console.log("Found Facebook image from img tag:", imgTagMatches[1]);
+      return imgTagMatches[1];
+    }
 
-      // Method 3: Image elements
-      if (!imageUrl) {
-        const possibleImages = $("img")
-          .filter(function () {
-            const src = $(this).attr("src");
-            return (
-              src &&
-              (src.includes("fbcdn.net") ||
-                src.includes("scontent") ||
-                src.includes("facebook.com/safe_image.php"))
-            );
-          })
-          .map(function () {
-            return $(this).attr("src");
-          })
-          .get();
+    // If all else fails, try to extract any image URL from the page
+    const anyImageMatch = html.match(
+      /https:\/\/[^"']*\.(?:jpg|jpeg|png|gif|webp)[^"']*/i
+    );
+    if (anyImageMatch) {
+      console.log(
+        "Found Facebook image from general pattern:",
+        anyImageMatch[0]
+      );
+      return anyImageMatch[0];
+    }
 
-        if (possibleImages.length > 0) {
-          // Prioritize high-resolution images
-          imageUrl =
-            possibleImages.find(
-              (img) => img.includes("_n.") || img.includes("_o.")
-            ) || possibleImages[0];
-          extractionMethod = "image_elements";
-        }
-      }
+    console.log("No Facebook image found in the page");
+    return null;
+  } catch (error) {
+    console.error("Error extracting Facebook image:", error.message);
+    return null;
+  }
+};
 
-      // Method 4: Regex pattern matching
-      if (!imageUrl) {
-        const fbcdnPattern =
-          /https:\/\/[a-z0-9-]+\.fbcdn\.net\/[a-z0-9_\/.]+\.(?:jpg|jpeg|png|gif)/gi;
-        const matches = data.match(fbcdnPattern);
-        if (matches && matches.length > 0) {
-          imageUrl = matches[0];
-          extractionMethod = "regex_pattern";
-        }
-      }
+// Update the Facebook post route
+router.post("/facebook", protect, async (req, res) => {
+  try {
+    const { url } = req.body;
 
-      // Method 5: Fallback for share URLs
-      if (!imageUrl && postUrl.includes("/share/p/")) {
-        const postIdMatch = postUrl.match(/\/share\/p\/([a-zA-Z0-9_-]+)/);
-        if (postIdMatch && postIdMatch[1]) {
-          imageUrl =
-            "https://static.xx.fbcdn.net/rsrc.php/v3/y4/r/-PAXP-deijE.gif";
-          extractionMethod = "fallback_share";
-        }
-      }
-
-      if (!imageUrl) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Could not find image for the Facebook post. This might be due to privacy settings or Facebook's anti-scraping measures.",
-        });
-      }
-
-      // Verify image accessibility with retry
-      const isAccessible = await retryWithBackoff(async () => {
-        return await verifyImageAccessibility(imageUrl, "facebook");
-      });
-
-      if (!isAccessible) {
-        console.log("Image not accessible, trying alternative methods...");
-        // Try to find alternative image URLs
-        const alternativeImages = $("img")
-          .map(function () {
-            return $(this).attr("src");
-          })
-          .get()
-          .filter((src) => src && src.includes("fbcdn.net"));
-
-        for (const altImage of alternativeImages) {
-          if (await verifyImageAccessibility(altImage, "facebook")) {
-            imageUrl = altImage;
-            extractionMethod = "alternative_image";
-            break;
-          }
-        }
-      }
-
-      // Cache the successful image URL
-      setCachedImage(postUrl, imageUrl);
-
-      // Create new post using Post model
-      const post = await Post.create({
-        user: req.user._id,
-        platform: "facebook",
-        url: postUrl,
-        imageUrl: imageUrl,
-        title: "",
-        description: "",
-      });
-
-      return res.status(200).json({
-        success: true,
-        platform: "facebook",
-        url: postUrl,
-        imageUrl: imageUrl,
-        extractionMethod,
-        message: "Facebook post image added successfully",
-      });
-    } catch (error) {
-      console.error("Facebook scraping error:", error);
-      return res.status(404).json({
+    if (!url) {
+      return res.status(400).json({
         success: false,
-        message:
-          "Error accessing Facebook post. It may be private or not publicly accessible.",
-        error: error.message,
+        message: "URL is required",
       });
     }
+
+    // Validate URL format
+    if (!url.includes("facebook.com")) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid Facebook URL",
+      });
+    }
+
+    // Check if post already exists
+    const existingPost = await Post.findOne({
+      userId: req.user._id,
+      url: url,
+      platform: "facebook",
+    });
+
+    if (existingPost) {
+      return res.status(400).json({
+        success: false,
+        message: "This Facebook post has already been added",
+      });
+    }
+
+    // Extract image URL
+    let imageUrl = null;
+    try {
+      imageUrl = await extractFacebookImageUrl(url);
+      console.log("Extracted Facebook image URL:", imageUrl);
+    } catch (error) {
+      console.error("Error extracting Facebook image:", error);
+      // Continue without image
+    }
+
+    // Create new post
+    const newPost = new Post({
+      userId: req.user._id,
+      platform: "facebook",
+      url: url,
+      imageUrl: imageUrl,
+      addedAt: new Date(),
+    });
+
+    await newPost.save();
+
+    return res.status(201).json({
+      success: true,
+      message: "Facebook post added successfully",
+      post: newPost,
+    });
   } catch (error) {
-    console.error("Facebook API error:", error);
+    console.error("Error adding Facebook post:", error);
     return res.status(500).json({
       success: false,
-      message: "Error fetching Facebook image",
+      message: "Error adding Facebook post",
       error: error.message,
     });
   }
@@ -1382,28 +1391,27 @@ router.get("/posts/all", protect, async (req, res) => {
 });
 
 // Delete a post
-router.delete("/post", protect, async (req, res) => {
+router.delete("/post/:postId", protect, async (req, res) => {
   try {
-    const { url, platform } = req.body;
+    const { postId } = req.params;
 
-    if (!url || !platform) {
+    if (!postId) {
       return res.status(400).json({
         success: false,
-        message: "URL and platform are required",
+        message: "Post ID is required",
       });
     }
 
-    // Find and delete the post
-    const post = await Post.findOneAndDelete({
+    // Find and delete the post, ensuring it belongs to the user
+    const deletedPost = await Post.findOneAndDelete({
+      _id: postId,
       user: req.user._id,
-      url,
-      platform,
     });
 
-    if (!post) {
+    if (!deletedPost) {
       return res.status(404).json({
         success: false,
-        message: "Post not found",
+        message: "Post not found or unauthorized",
       });
     }
 
@@ -1422,26 +1430,16 @@ router.delete("/post", protect, async (req, res) => {
 });
 
 // Update post selected status
-router.patch("/post/selected", protect, async (req, res) => {
+router.post("/select", protect, async (req, res) => {
   try {
-    const { url, platform, selected } = req.body;
-
-    if (!url || !platform || selected === undefined) {
-      return res.status(400).json({
-        success: false,
-        message: "URL, platform, and selected status are required",
-      });
-    }
+    console.log(req.body);
+    const { postId } = req.body;
 
     // Find and update the post
-    const post = await Post.findOneAndUpdate(
+    const post = await Post.findByIdAndUpdate(
+      postId,
       {
-        user: req.user._id,
-        url,
-        platform,
-      },
-      {
-        selected,
+        selected: true,
       },
       {
         new: true,
@@ -1864,6 +1862,191 @@ router.get("/posts/:platform/selected", protect, async (req, res) => {
       message: "Error fetching selected posts by platform",
       error: error.message,
     });
+  }
+});
+
+// Deselect a post
+router.post("/deselect", protect, async (req, res) => {
+  try {
+    const { postId } = req.body;
+
+    if (!postId) {
+      return res.status(400).json({
+        success: false,
+        message: "Post ID is required",
+      });
+    }
+
+    // Find and update the post, ensuring it belongs to the user
+    const updatedPost = await Post.findOneAndUpdate(
+      {
+        _id: postId,
+        user: req.user._id,
+      },
+      {
+        selected: false,
+      },
+      { new: true }
+    );
+
+    if (!updatedPost) {
+      return res.status(404).json({
+        success: false,
+        message: "Post not found or unauthorized",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Post deselected successfully",
+    });
+  } catch (error) {
+    console.error("Error deselecting post:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error deselecting post",
+      error: error.message,
+    });
+  }
+});
+
+// Image proxy endpoint to bypass CORS restrictions
+router.get("/proxy/image", async (req, res) => {
+  try {
+    const { url } = req.query;
+
+    if (!url) {
+      return res.status(400).json({
+        success: false,
+        message: "Image URL is required",
+      });
+    }
+
+    console.log("Proxying image:", url);
+
+    // Check cache first
+    const cachedImageUrl = getCachedImage(url);
+    if (cachedImageUrl) {
+      console.log("Using cached image:", cachedImageUrl);
+      return res.redirect(cachedImageUrl);
+    }
+
+    // Determine the appropriate referer based on the URL
+    let referer = "https://www.google.com/";
+    if (url.includes("instagram.com")) {
+      referer = "https://www.instagram.com/";
+    } else if (url.includes("facebook.com") || url.includes("fbcdn.net")) {
+      referer = "https://www.facebook.com/";
+    } else if (url.includes("tiktok.com")) {
+      referer = "https://www.tiktok.com/";
+    }
+
+    // Enhanced request with better headers and error handling
+    const response = await axios({
+      method: "get",
+      url: url,
+      responseType: "arraybuffer",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        Referer: referer,
+        Accept: "image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
+        DNT: "1",
+        Connection: "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "image",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "cross-site",
+      },
+      // Set longer timeout for large images
+      timeout: 15000,
+      maxRedirects: 5,
+      validateStatus: function (status) {
+        return status >= 200 && status < 400; // Accept 2xx and 3xx status codes
+      },
+    });
+
+    // Set appropriate headers
+    const contentType = response.headers["content-type"] || "image/jpeg";
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "public, max-age=86400"); // Cache for a day
+    res.setHeader("Access-Control-Allow-Origin", "*"); // Allow cross-origin access
+
+    // Cache the successful image URL
+    setCachedImage(url, url);
+
+    // Send the image data
+    res.send(response.data);
+  } catch (error) {
+    console.error("Image proxy error:", error.message);
+
+    // Try alternative method for Instagram images
+    if (
+      error.response &&
+      (error.response.status === 403 || error.response.status === 401)
+    ) {
+      try {
+        const { url } = req.query;
+        if (url.includes("instagram.com")) {
+          // Try with a different approach for Instagram
+          const response = await axios({
+            method: "get",
+            url: url,
+            responseType: "arraybuffer",
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 14_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Mobile/15E148 Safari/604.1",
+              Accept: "image/webp,image/apng,image/*,*/*;q=0.8",
+              "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout: 10000,
+          });
+
+          res.setHeader(
+            "Content-Type",
+            response.headers["content-type"] || "image/jpeg"
+          );
+          res.setHeader("Cache-Control", "public, max-age=86400");
+          res.setHeader("Access-Control-Allow-Origin", "*");
+
+          return res.send(response.data);
+        }
+      } catch (fallbackError) {
+        console.error("Fallback image proxy error:", fallbackError.message);
+      }
+    }
+
+    // If the error is related to the image not being found, return a 404
+    if (error.response && error.response.status === 404) {
+      return res.status(404).json({
+        success: false,
+        message: "Image not found",
+        error: error.message,
+      });
+    }
+
+    // Return a fallback image based on the platform
+    const url = req.query.url || "";
+    let fallbackImage = null;
+
+    if (url.includes("instagram.com")) {
+      fallbackImage =
+        "https://www.instagram.com/static/images/ico/favicon-192.png/68d99ba29cc8.png";
+    } else if (url.includes("facebook.com") || url.includes("fbcdn.net")) {
+      fallbackImage =
+        "https://static.xx.fbcdn.net/rsrc.php/v3/y4/r/-PAXP-deijE.gif";
+    } else if (url.includes("tiktok.com")) {
+      fallbackImage =
+        "https://sf16-sg.tiktokcdn.com/obj/eden-sg/uvkuhyieh7lpqegw/tiktok_logo.png";
+    } else {
+      fallbackImage =
+        "https://via.placeholder.com/300x300?text=Image+Not+Available";
+    }
+
+    return res.redirect(fallbackImage);
   }
 });
 
