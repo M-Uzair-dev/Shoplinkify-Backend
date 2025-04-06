@@ -78,96 +78,6 @@ const userSchema = new mongoose.Schema(
         default: "6",
       },
     },
-    youtubePosts: {
-      type: [
-        {
-          url: String,
-          embedCode: String,
-          videoId: String,
-          thumbnailUrl: String,
-          title: String,
-          channelName: String,
-          channelImage: String,
-          description: String,
-          productLink: String,
-          selected: {
-            type: Boolean,
-            default: false,
-          },
-          addedAt: {
-            type: Date,
-            default: Date.now,
-          },
-        },
-      ],
-      default: [],
-    },
-    tiktokPosts: {
-      type: [
-        {
-          url: String,
-          thumbnailUrl: String,
-          caption: String,
-          videoId: String,
-          username: String,
-          userImage: String,
-          videoPath: String,
-          title: String,
-          description: String,
-          productLink: String,
-          selected: {
-            type: Boolean,
-            default: false,
-          },
-          addedAt: {
-            type: Date,
-            default: Date.now,
-          },
-        },
-      ],
-      default: [],
-    },
-    instagramPosts: {
-      type: [
-        {
-          url: String,
-          imageUrl: String,
-          embedCode: String,
-          title: String,
-          description: String,
-          productLink: String,
-          selected: {
-            type: Boolean,
-            default: false,
-          },
-          addedAt: {
-            type: Date,
-            default: Date.now,
-          },
-        },
-      ],
-      default: [],
-    },
-    facebookPosts: {
-      type: [
-        {
-          url: String,
-          imageUrl: String,
-          title: String,
-          description: String,
-          productLink: String,
-          selected: {
-            type: Boolean,
-            default: false,
-          },
-          addedAt: {
-            type: Date,
-            default: Date.now,
-          },
-        },
-      ],
-      default: [],
-    },
     mainHeading: {
       type: String,
       default: "Enter Main heading",
@@ -175,16 +85,6 @@ const userSchema = new mongoose.Schema(
     subHeading: {
       type: String,
       default: "Enter Sub heading",
-    },
-
-    // Legacy fields for backward compatibility
-    youtubeEmbeds: {
-      type: [String],
-      default: [],
-    },
-    tiktokEmbeds: {
-      type: [String],
-      default: [],
     },
     createdAt: {
       type: Date,

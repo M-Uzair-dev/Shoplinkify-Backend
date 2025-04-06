@@ -1,5 +1,6 @@
 const User = require("../models/User");
 const { validationResult } = require("express-validator");
+const Post = require("../models/Post");
 
 exports.updateUser = async (req, res) => {
   try {
@@ -168,16 +169,21 @@ exports.getPostCounts = async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
+    // Get counts from Post model
+    const [youtubeCount, tiktokCount, instagramCount, facebookCount] =
+      await Promise.all([
+        Post.countDocuments({ user: req.user.id, platform: "youtube" }),
+        Post.countDocuments({ user: req.user.id, platform: "tiktok" }),
+        Post.countDocuments({ user: req.user.id, platform: "instagram" }),
+        Post.countDocuments({ user: req.user.id, platform: "facebook" }),
+      ]);
+
     const counts = {
-      total:
-        user.youtubePosts.length +
-        user.tiktokPosts.length +
-        user.instagramPosts.length +
-        user.facebookPosts.length,
-      instagram: user.instagramPosts.length,
-      tiktok: user.tiktokPosts.length,
-      facebook: user.facebookPosts.length,
-      youtube: user.youtubePosts.length,
+      total: youtubeCount + tiktokCount + instagramCount + facebookCount,
+      instagram: instagramCount,
+      tiktok: tiktokCount,
+      facebook: facebookCount,
+      youtube: youtubeCount,
     };
 
     res.json({

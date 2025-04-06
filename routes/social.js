@@ -1,11 +1,67 @@
 const express = require("express");
 const router = express.Router();
 const User = require("../models/User");
+const Post = require("../models/Post");
 const axios = require("axios");
 const { URL } = require("url");
 const cheerio = require("cheerio");
 const { protect } = require("../middleware/auth");
-const proxyService = require("../utils/proxyService");
+
+// Add these utility functions at the top of the file after the imports
+const CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+const imageCache = new Map();
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const retryWithBackoff = async (fn, maxRetries = 3, initialDelay = 1000) => {
+  let retries = 0;
+  while (retries < maxRetries) {
+    try {
+      return await fn();
+    } catch (error) {
+      retries++;
+      if (retries === maxRetries) throw error;
+      const delay = initialDelay * Math.pow(2, retries - 1);
+      await sleep(delay);
+    }
+  }
+};
+
+const verifyImageAccessibility = async (imageUrl, platform) => {
+  try {
+    await axios.head(imageUrl, {
+      timeout: 5000,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+        Referer: `https://www.${platform}.com/`,
+        Accept: "image/webp,image/apng,image/*,*/*;q=0.8",
+      },
+    });
+    return true;
+  } catch (error) {
+    console.log(
+      `Warning: ${platform} image may not be directly accessible:`,
+      error.message
+    );
+    return false;
+  }
+};
+
+const getCachedImage = (url) => {
+  const cached = imageCache.get(url);
+  if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+    return cached.imageUrl;
+  }
+  return null;
+};
+
+const setCachedImage = (url, imageUrl) => {
+  imageCache.set(url, {
+    imageUrl,
+    timestamp: Date.now(),
+  });
+};
 
 router.get("/post/details", protect, async (req, res) => {
   try {
@@ -14,36 +70,26 @@ router.get("/post/details", protect, async (req, res) => {
     if (!url || !platform) {
       return res.status(400).json({
         success: false,
-        message: "URL and platform are required in the query parameters",
+        message: "URL and platform are required",
       });
     }
 
-    if (!["youtube", "tiktok", "instagram", "facebook"].includes(platform)) {
+    // Validate platform
+    const validPlatforms = ["youtube", "tiktok", "instagram", "facebook"];
+    if (!validPlatforms.includes(platform)) {
       return res.status(400).json({
         success: false,
         message:
-          "Invalid platform. Must be youtube, tiktok, instagram, or facebook",
+          "Invalid platform. Must be one of: youtube, tiktok, instagram, facebook",
       });
     }
 
-    const user = req.user;
-    let post = null;
-
-    // Find the post based on platform
-    switch (platform) {
-      case "youtube":
-        post = user.youtubePosts.find((post) => post.url === url);
-        break;
-      case "tiktok":
-        post = user.tiktokPosts.find((post) => post.url === url);
-        break;
-      case "instagram":
-        post = user.instagramPosts.find((post) => post.url === url);
-        break;
-      case "facebook":
-        post = user.facebookPosts.find((post) => post.url === url);
-        break;
-    }
+    // Find the post
+    const post = await Post.findOne({
+      user: req.user._id,
+      url,
+      platform,
+    }).lean();
 
     if (!post) {
       return res.status(404).json({
@@ -52,13 +98,13 @@ router.get("/post/details", protect, async (req, res) => {
       });
     }
 
-    return res.status(200).json({
+    res.json({
       success: true,
       data: post,
     });
   } catch (error) {
     console.error("Error fetching post details:", error);
-    return res.status(500).json({
+    res.status(500).json({
       success: false,
       message: "Error fetching post details",
       error: error.message,
@@ -160,8 +206,10 @@ router.post("/youtube", protect, async (req, res) => {
         channelImage,
       });
 
-      // Save to user's profile
-      req.user.youtubePosts.push({
+      // Create new post using Post model
+      const post = await Post.create({
+        user: req.user._id,
+        platform: "youtube",
         url: normalizedUrl,
         videoId: videoId,
         thumbnailUrl: thumbnailUrl,
@@ -170,9 +218,7 @@ router.post("/youtube", protect, async (req, res) => {
         channelImage: channelImage,
         description: snippet.description || "",
         embedCode: embedCode,
-        addedAt: new Date(),
       });
-      await req.user.save();
 
       return res.status(200).json({
         success: true,
@@ -199,7 +245,6 @@ router.post("/youtube", protect, async (req, res) => {
         success: false,
         message: "Error fetching YouTube data",
         error: error.message,
-        details: error.response?.data,
       });
     }
   } catch (error) {
@@ -470,19 +515,16 @@ router.post("/instagram", protect, async (req, res) => {
       const originalUrl = imageUrl;
 
       imageUrl = imageUrl
-
         .replace(/\/s\d+x\d+\//, "/")
         .replace(/\/c\d+\.\d+\.\d+\.\d+\//, "/")
         .replace(/\/e\d+\//, "/")
         .replace(/\/[a-z]\d+x\d+\//, "/")
         .replace(/\/(vp|p|s)[0-9]+x[0-9]+(_[0-9]+)?\//, "/")
         .replace(/\/p[0-9]+x[0-9]+\//, "/")
-
         .replace(/[\?&]se=\d+/, "")
         .replace(/[\?&]sh=\d+/, "")
         .replace(/[\?&]sw=\d+/, "")
         .replace(/[\?&]quality=\d+/, "")
-
         .replace(/\?_nc_ht.*$/, "")
         .replace(/\?_nc_cat.*$/, "")
         .replace(/\?igshid.*$/, "")
@@ -521,15 +563,16 @@ router.post("/instagram", protect, async (req, res) => {
         ? processedUrl.replace("/embed/", "/")
         : processedUrl;
 
-      req.user.instagramPosts.push({
+      // Create new post using Post model
+      const post = await Post.create({
+        user: req.user._id,
+        platform: "instagram",
         url: postUrl,
         imageUrl: imageUrl,
         embedCode: originalEmbedCode,
         title: "",
         description: "",
-        addedAt: new Date(),
       });
-      await req.user.save();
 
       return res.status(200).json({
         success: true,
@@ -558,156 +601,229 @@ router.post("/instagram", protect, async (req, res) => {
   }
 });
 
-// Facebook post details endpoint
-router.get("/facebook/post-details", async (req, res) => {
+// Replace the Facebook image extraction section with this enhanced version
+router.post("/facebook", protect, async (req, res) => {
   try {
-    const { url } = req.query;
+    const { url: postUrl } = req.body;
 
-    if (!url) {
-      return res.status(400).json({ error: "URL is required" });
-    }
-
-    // Validate Facebook URL
-    const facebookUrlRegex = /^https?:\/\/(www\.)?(facebook\.com|fb\.com)\/.*$/;
-    if (!facebookUrlRegex.test(url)) {
-      return res.status(400).json({ error: "Invalid Facebook URL" });
-    }
-
-    console.log("Fetching Facebook content for URL:", url);
-
-    // Enhanced request headers to mimic a real browser
-    const headers = {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      Accept:
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-      "Accept-Language": "en-US,en;q=0.9",
-      "Accept-Encoding": "gzip, deflate, br",
-      Connection: "keep-alive",
-      "Upgrade-Insecure-Requests": "1",
-      "Sec-Fetch-Dest": "document",
-      "Sec-Fetch-Mode": "navigate",
-      "Sec-Fetch-Site": "none",
-      "Sec-Fetch-User": "?1",
-      "Cache-Control": "max-age=0",
-    };
-
-    // Try to fetch the Facebook content using the proxy service
-    let response;
-    try {
-      response = await proxyService.request(url, {
-        method: "GET",
-        headers,
-        timeout: 15000,
+    if (!postUrl) {
+      return res.status(400).json({
+        success: false,
+        message: "Post URL is required in the request body",
       });
-    } catch (error) {
-      console.error(
-        "Failed to fetch Facebook content through proxy:",
-        error.message
-      );
-
-      // Fall back to direct request
-      console.log("Falling back to direct request");
-      response = await axios.get(url, { headers });
     }
 
-    const html = response.data;
-
-    // Extract post details
-    const postDetails = {
-      title: "",
-      description: "",
-      imageUrl: "",
-      author: "",
-      publishedTime: "",
-      url: url,
-    };
-
-    // Extract title
-    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
-    if (titleMatch) {
-      postDetails.title = titleMatch[1].trim();
+    // Check cache first
+    const cachedImageUrl = getCachedImage(postUrl);
+    if (cachedImageUrl) {
+      console.log("Using cached Facebook image:", cachedImageUrl);
+      return res.status(200).json({
+        success: true,
+        platform: "facebook",
+        url: postUrl,
+        imageUrl: cachedImageUrl,
+        extractionMethod: "cache",
+        message: "Facebook post image retrieved from cache",
+      });
     }
 
-    // Extract description
-    const descriptionMatch = html.match(
-      /<meta[^>]*property="og:description"[^>]*content="([^"]*)"[^>]*>/i
-    );
-    if (descriptionMatch) {
-      postDetails.description = descriptionMatch[1].trim();
+    // Validate URL format
+    if (
+      !/^https?:\/\/(www\.)?(facebook|fb)\.com\/[a-zA-Z0-9.]+\/posts\/|^https?:\/\/(www\.)?(facebook|fb)\.com\/[a-zA-Z0-9.]+\/photos\/|^https?:\/\/(www\.)?(facebook|fb)\.com\/share\/p\/[a-zA-Z0-9_-]+\/|^https?:\/\/(www\.)?(facebook|fb)\.com\/share\/v\/[a-zA-Z0-9_-]+\//.test(
+        postUrl
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid Facebook URL. Must be a post, photo, or share URL",
+      });
     }
 
-    // Extract image URL
-    const imageMatch = html.match(
-      /<meta[^>]*property="og:image"[^>]*content="([^"]*)"[^>]*>/i
-    );
-    if (imageMatch) {
-      postDetails.imageUrl = imageMatch[1].trim();
-    }
+    try {
+      // Enhanced request headers
+      const headers = {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        Referer: "https://www.google.com/",
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
+        DNT: "1",
+        Connection: "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+      };
 
-    // Extract author
-    const authorMatch = html.match(
-      /<meta[^>]*property="article:author"[^>]*content="([^"]*)"[^>]*>/i
-    );
-    if (authorMatch) {
-      postDetails.author = authorMatch[1].trim();
-    }
-
-    // Extract published time
-    const publishedTimeMatch = html.match(
-      /<meta[^>]*property="article:published_time"[^>]*content="([^"]*)"[^>]*>/i
-    );
-    if (publishedTimeMatch) {
-      postDetails.publishedTime = publishedTimeMatch[1].trim();
-    }
-
-    // Verify image accessibility
-    if (postDetails.imageUrl) {
-      try {
-        // Try to access the image through the proxy service
-        await proxyService.request(postDetails.imageUrl, {
-          method: "HEAD",
-          timeout: 5000,
-          headers: {
-            "User-Agent": headers["User-Agent"],
-            Referer: url,
-          },
+      // Fetch Facebook content with retry
+      const { data } = await retryWithBackoff(async () => {
+        console.log("Attempting to fetch Facebook content from:", postUrl);
+        return await axios.get(postUrl, {
+          headers,
+          timeout: 15000,
+          maxRedirects: 5,
         });
-      } catch (error) {
-        console.error("Failed to access image through proxy:", error.message);
+      });
 
-        // Fall back to direct request
-        try {
-          await axios.head(postDetails.imageUrl, {
-            timeout: 5000,
-            headers: {
-              "User-Agent": headers["User-Agent"],
-              Referer: url,
-            },
-          });
-        } catch (directError) {
-          console.error(
-            "Failed to access image directly:",
-            directError.message
-          );
+      console.log("Successfully fetched Facebook page HTML");
+      const $ = cheerio.load(data);
 
-          // Use a fallback image
-          postDetails.imageUrl =
-            "https://www.facebook.com/images/fb_icon_325x325.png";
+      // Enhanced image extraction with multiple methods
+      let imageUrl = null;
+      let extractionMethod = "";
+
+      // Method 1: Meta tags
+      imageUrl =
+        $('meta[property="og:image"]').attr("content") ||
+        $('meta[property="og:image:secure_url"]').attr("content") ||
+        $('meta[property="twitter:image"]').attr("content");
+      extractionMethod = "meta_tags";
+
+      // Method 2: Structured data
+      if (!imageUrl) {
+        const scripts = $('script[type="application/ld+json"]')
+          .map(function () {
+            return $(this).html();
+          })
+          .get();
+
+        for (const script of scripts) {
+          try {
+            const ldJson = JSON.parse(script);
+            if (ldJson.image) {
+              imageUrl = Array.isArray(ldJson.image)
+                ? ldJson.image[0]
+                : ldJson.image;
+              extractionMethod = "structured_data";
+              break;
+            }
+          } catch (e) {
+            // Skip invalid JSON
+          }
         }
       }
-    } else {
-      // Use a fallback image if no image URL was found
-      postDetails.imageUrl =
-        "https://www.facebook.com/images/fb_icon_325x325.png";
+
+      // Method 3: Image elements
+      if (!imageUrl) {
+        const possibleImages = $("img")
+          .filter(function () {
+            const src = $(this).attr("src");
+            return (
+              src &&
+              (src.includes("fbcdn.net") ||
+                src.includes("scontent") ||
+                src.includes("facebook.com/safe_image.php"))
+            );
+          })
+          .map(function () {
+            return $(this).attr("src");
+          })
+          .get();
+
+        if (possibleImages.length > 0) {
+          // Prioritize high-resolution images
+          imageUrl =
+            possibleImages.find(
+              (img) => img.includes("_n.") || img.includes("_o.")
+            ) || possibleImages[0];
+          extractionMethod = "image_elements";
+        }
+      }
+
+      // Method 4: Regex pattern matching
+      if (!imageUrl) {
+        const fbcdnPattern =
+          /https:\/\/[a-z0-9-]+\.fbcdn\.net\/[a-z0-9_\/.]+\.(?:jpg|jpeg|png|gif)/gi;
+        const matches = data.match(fbcdnPattern);
+        if (matches && matches.length > 0) {
+          imageUrl = matches[0];
+          extractionMethod = "regex_pattern";
+        }
+      }
+
+      // Method 5: Fallback for share URLs
+      if (!imageUrl && postUrl.includes("/share/p/")) {
+        const postIdMatch = postUrl.match(/\/share\/p\/([a-zA-Z0-9_-]+)/);
+        if (postIdMatch && postIdMatch[1]) {
+          imageUrl =
+            "https://static.xx.fbcdn.net/rsrc.php/v3/y4/r/-PAXP-deijE.gif";
+          extractionMethod = "fallback_share";
+        }
+      }
+
+      if (!imageUrl) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "Could not find image for the Facebook post. This might be due to privacy settings or Facebook's anti-scraping measures.",
+        });
+      }
+
+      // Verify image accessibility with retry
+      const isAccessible = await retryWithBackoff(async () => {
+        return await verifyImageAccessibility(imageUrl, "facebook");
+      });
+
+      if (!isAccessible) {
+        console.log("Image not accessible, trying alternative methods...");
+        // Try to find alternative image URLs
+        const alternativeImages = $("img")
+          .map(function () {
+            return $(this).attr("src");
+          })
+          .get()
+          .filter((src) => src && src.includes("fbcdn.net"));
+
+        for (const altImage of alternativeImages) {
+          if (await verifyImageAccessibility(altImage, "facebook")) {
+            imageUrl = altImage;
+            extractionMethod = "alternative_image";
+            break;
+          }
+        }
+      }
+
+      // Cache the successful image URL
+      setCachedImage(postUrl, imageUrl);
+
+      // Create new post using Post model
+      const post = await Post.create({
+        user: req.user._id,
+        platform: "facebook",
+        url: postUrl,
+        imageUrl: imageUrl,
+        title: "",
+        description: "",
+      });
+
+      return res.status(200).json({
+        success: true,
+        platform: "facebook",
+        url: postUrl,
+        imageUrl: imageUrl,
+        extractionMethod,
+        message: "Facebook post image added successfully",
+      });
+    } catch (error) {
+      console.error("Facebook scraping error:", error);
+      return res.status(404).json({
+        success: false,
+        message:
+          "Error accessing Facebook post. It may be private or not publicly accessible.",
+        error: error.message,
+      });
     }
-
-    console.log("Successfully fetched Facebook content:", postDetails);
-
-    res.json(postDetails);
   } catch (error) {
-    console.error("Error fetching Facebook content:", error);
-    res.status(500).json({ error: "Failed to fetch Facebook content" });
+    console.error("Facebook API error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error fetching Facebook image",
+      error: error.message,
+    });
   }
 });
 
@@ -766,8 +882,10 @@ router.post("/tiktok", protect, async (req, res) => {
           videoPath,
         });
 
-        // Save to user's profile with additional fields
-        req.user.tiktokPosts.push({
+        // Create new post using Post model
+        const post = await Post.create({
+          user: req.user._id,
+          platform: "tiktok",
           url: videoUrl,
           thumbnailUrl: thumbnailUrl,
           caption: caption,
@@ -777,10 +895,7 @@ router.post("/tiktok", protect, async (req, res) => {
           videoPath: videoPath,
           title: caption || "",
           description: "",
-          addedAt: new Date(),
         });
-
-        await req.user.save();
 
         return res.status(200).json({
           success: true,
@@ -828,15 +943,14 @@ router.post("/tiktok", protect, async (req, res) => {
             thumbnailUrl
           );
 
-          // Save to user's profile with minimal data
-          req.user.tiktokPosts.push({
+          // Create new post using Post model
+          const post = await Post.create({
+            user: req.user._id,
+            platform: "tiktok",
             url: videoUrl,
             thumbnailUrl: thumbnailUrl,
             caption: caption,
-            addedAt: new Date(),
           });
-
-          await req.user.save();
 
           return res.status(200).json({
             success: true,
@@ -859,14 +973,13 @@ router.post("/tiktok", protect, async (req, res) => {
       const fallbackThumbnail =
         "https://sf16-sg.tiktokcdn.com/obj/eden-sg/uvkuhyieh7lpqegw/tiktok_logo.png";
 
-      // Still save the post with fallback image
-      req.user.tiktokPosts.push({
+      // Create new post using Post model with fallback image
+      const post = await Post.create({
+        user: req.user._id,
+        platform: "tiktok",
         url: videoUrl,
         thumbnailUrl: fallbackThumbnail,
-        addedAt: new Date(),
       });
-
-      await req.user.save();
 
       // We still return success, just with the fallback image
       return res.status(200).json({
@@ -1179,46 +1292,35 @@ router.post("/platforms/toggle", protect, async (req, res) => {
   }
 });
 
-// Get posts by platform type
+// Get posts by platform
 router.get("/:platform", protect, async (req, res) => {
   try {
-    const user = req.user;
-    const platform = req.params.platform.toLowerCase();
+    const { platform } = req.params;
 
-    // Check if platform is valid
+    // Validate platform
     const validPlatforms = ["youtube", "tiktok", "instagram", "facebook"];
     if (!validPlatforms.includes(platform)) {
       return res.status(400).json({
         success: false,
         message:
-          "Invalid platform. Must be youtube, tiktok, instagram, or facebook",
+          "Invalid platform. Must be one of: youtube, tiktok, instagram, facebook",
       });
     }
 
-    // Get posts for the specified platform from user model
-    let posts = [];
-    switch (platform) {
-      case "youtube":
-        posts = user.youtubePosts;
-        break;
-      case "tiktok":
-        posts = user.tiktokPosts;
-        break;
-      case "instagram":
-        posts = user.instagramPosts;
-        break;
-      case "facebook":
-        posts = user.facebookPosts;
-        break;
-    }
+    const posts = await Post.find({
+      user: req.user._id,
+      platform,
+    })
+      .sort({ addedAt: -1 })
+      .lean();
 
-    return res.status(200).json({
+    res.json({
       success: true,
       data: posts,
     });
   } catch (error) {
     console.error("Error fetching posts:", error);
-    return res.status(500).json({
+    res.status(500).json({
       success: false,
       message: "Error fetching posts",
       error: error.message,
@@ -1226,70 +1328,52 @@ router.get("/:platform", protect, async (req, res) => {
   }
 });
 
-// Get all posts based on selected platforms
+// Get all posts for a user
 router.get("/posts/all", protect, async (req, res) => {
   try {
     const user = req.user;
     const { selectedPlatforms, feedSettings } = user;
     const postsCount = parseInt(feedSettings?.postsCount || "6");
 
-    let allPosts = [];
+    let platforms = [];
+    if (selectedPlatforms.instagram) platforms.push("instagram");
+    if (selectedPlatforms.facebook) platforms.push("facebook");
+    if (selectedPlatforms.youtube) platforms.push("youtube");
+    if (selectedPlatforms.tiktok) platforms.push("tiktok");
 
     // Get posts for each selected platform
-    if (selectedPlatforms.youtube) {
-      const youtubePosts = user.youtubePosts
-        .filter((post) => post.selected)
-        .map((post) => ({
-          imageUrl: post.thumbnailUrl, // Map thumbnailUrl to imageUrl for consistency
-          url: post.url,
-          platform: "youtube",
-        }));
-      allPosts.push(...youtubePosts);
-    }
-    if (selectedPlatforms.tiktok) {
-      const tiktokPosts = user.tiktokPosts
-        .filter((post) => post.selected)
-        .map((post) => ({
-          imageUrl: post.thumbnailUrl, // Map thumbnailUrl to imageUrl for consistency
-          url: post.url,
-          platform: "tiktok",
-        }));
-      allPosts.push(...tiktokPosts);
-    }
-    if (selectedPlatforms.instagram) {
-      const instagramPosts = user.instagramPosts
-        .filter((post) => post.selected)
-        .map((post) => ({
-          imageUrl: post.imageUrl,
-          url: post.url,
-          platform: "instagram",
-        }));
-      allPosts.push(...instagramPosts);
-    }
-    if (selectedPlatforms.facebook) {
-      const facebookPosts = user.facebookPosts
-        .filter((post) => post.selected)
-        .map((post) => ({
-          imageUrl: post.imageUrl,
-          url: post.url,
-          platform: "facebook",
-        }));
-      allPosts.push(...facebookPosts);
-    }
+    const posts = await Post.find({
+      user: req.user._id,
+      platform: {
+        $in: platforms,
+      },
+      selected: true,
+    })
+      .sort({ addedAt: -1 })
+      .limit(postsCount)
+      .select("imageUrl url platform thumbnailUrl")
+      .lean();
 
-    // Sort posts by addedAt in descending order (newest first)
-    allPosts.sort((a, b) => new Date(b.addedAt) - new Date(a.addedAt));
+    // Map posts to consistent format and use proxy for TikTok images
+    const formattedPosts = posts.map((post) => {
+      let imageUrl = post.thumbnailUrl || post.imageUrl;
 
-    // Take only the required number of posts
-    allPosts = allPosts.slice(0, postsCount);
+      return {
+        imageUrl,
+        url: post.url,
+        platform: post.platform,
+      };
+    });
 
-    return res.status(200).json({
+    console.log(posts);
+
+    res.json({
       success: true,
-      posts: allPosts,
+      posts: formattedPosts,
     });
   } catch (error) {
-    console.error("Error fetching all posts:", error);
-    return res.status(500).json({
+    console.error("Error fetching posts:", error);
+    res.status(500).json({
       success: false,
       message: "Error fetching posts",
       error: error.message,
@@ -1297,394 +1381,10 @@ router.get("/posts/all", protect, async (req, res) => {
   }
 });
 
-// Image proxy endpoint to bypass CORS restrictions
-router.get("/proxy/image", async (req, res) => {
-  try {
-    const { url } = req.query;
-
-    if (!url) {
-      return res.status(400).json({
-        success: false,
-        message: "Image URL is required",
-      });
-    }
-
-    console.log("Proxying image:", url);
-
-    const response = await axios({
-      method: "get",
-      url: url,
-      responseType: "arraybuffer",
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        Referer: "https://www.instagram.com/",
-        Accept: "image/webp,image/apng,image/*,*/*;q=0.8",
-      },
-      // Set longer timeout for large images
-      timeout: 10000,
-      maxRedirects: 5,
-    });
-
-    // Set appropriate headers
-    const contentType = response.headers["content-type"] || "image/jpeg";
-    res.setHeader("Content-Type", contentType);
-    res.setHeader("Cache-Control", "public, max-age=86400"); // Cache for a day
-    res.setHeader("Access-Control-Allow-Origin", "*"); // Allow cross-origin access
-
-    // Send the image data
-    res.send(response.data);
-  } catch (error) {
-    console.error("Image proxy error:", error.message);
-
-    // If the error is related to the image not being found, return a 404
-    if (error.response && error.response.status === 404) {
-      return res.status(404).json({
-        success: false,
-        message: "Image not found",
-        error: error.message,
-      });
-    }
-
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch image",
-      error: error.message,
-    });
-  }
-});
-
-// Select a post
-router.post("/select", protect, async (req, res) => {
+// Delete a post
+router.delete("/post", protect, async (req, res) => {
   try {
     const { url, platform } = req.body;
-
-    if (!url || !platform) {
-      return res.status(400).json({
-        success: false,
-        message: "URL and platform are required in the request body",
-      });
-    }
-
-    if (!["youtube", "tiktok", "instagram", "facebook"].includes(platform)) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Invalid platform. Must be youtube, tiktok, instagram, or facebook",
-      });
-    }
-
-    const user = req.user;
-    let updated = false;
-    let post = null;
-
-    // Find and update the post based on platform
-    switch (platform) {
-      case "youtube":
-        {
-          const postIndex = user.youtubePosts.findIndex(
-            (post) => post.url === url
-          );
-          if (postIndex !== -1) {
-            user.youtubePosts[postIndex].selected = true;
-            post = user.youtubePosts[postIndex];
-            updated = true;
-          }
-        }
-        break;
-
-      case "tiktok":
-        {
-          const postIndex = user.tiktokPosts.findIndex(
-            (post) => post.url === url
-          );
-          if (postIndex !== -1) {
-            user.tiktokPosts[postIndex].selected = true;
-            post = user.tiktokPosts[postIndex];
-            updated = true;
-          }
-        }
-        break;
-
-      case "instagram":
-        {
-          const postIndex = user.instagramPosts.findIndex(
-            (post) => post.url === url
-          );
-          if (postIndex !== -1) {
-            user.instagramPosts[postIndex].selected = true;
-            post = user.instagramPosts[postIndex];
-            updated = true;
-          }
-        }
-        break;
-
-      case "facebook":
-        {
-          const postIndex = user.facebookPosts.findIndex(
-            (post) => post.url === url
-          );
-          if (postIndex !== -1) {
-            user.facebookPosts[postIndex].selected = true;
-            post = user.facebookPosts[postIndex];
-            updated = true;
-          }
-        }
-        break;
-    }
-
-    if (updated) {
-      await user.save();
-      return res.status(200).json({
-        success: true,
-        message: `${platform} post selected successfully`,
-        data: post,
-      });
-    } else {
-      return res.status(404).json({
-        success: false,
-        message: `${platform} post not found with the provided URL`,
-      });
-    }
-  } catch (error) {
-    console.error("Select post error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Error selecting post",
-      error: error.message,
-    });
-  }
-});
-
-// Deselect a post
-router.post("/deselect", protect, async (req, res) => {
-  try {
-    const { url, platform } = req.body;
-
-    if (!url || !platform) {
-      return res.status(400).json({
-        success: false,
-        message: "URL and platform are required in the request body",
-      });
-    }
-
-    if (!["youtube", "tiktok", "instagram", "facebook"].includes(platform)) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Invalid platform. Must be youtube, tiktok, instagram, or facebook",
-      });
-    }
-
-    const user = req.user;
-    let updated = false;
-    let post = null;
-
-    // Find and update the post based on platform
-    switch (platform) {
-      case "youtube":
-        {
-          const postIndex = user.youtubePosts.findIndex(
-            (post) => post.url === url
-          );
-          if (postIndex !== -1) {
-            user.youtubePosts[postIndex].selected = false;
-            post = user.youtubePosts[postIndex];
-            updated = true;
-          }
-        }
-        break;
-
-      case "tiktok":
-        {
-          const postIndex = user.tiktokPosts.findIndex(
-            (post) => post.url === url
-          );
-          if (postIndex !== -1) {
-            user.tiktokPosts[postIndex].selected = false;
-            post = user.tiktokPosts[postIndex];
-            updated = true;
-          }
-        }
-        break;
-
-      case "instagram":
-        {
-          const postIndex = user.instagramPosts.findIndex(
-            (post) => post.url === url
-          );
-          if (postIndex !== -1) {
-            user.instagramPosts[postIndex].selected = false;
-            post = user.instagramPosts[postIndex];
-            updated = true;
-          }
-        }
-        break;
-
-      case "facebook":
-        {
-          const postIndex = user.facebookPosts.findIndex(
-            (post) => post.url === url
-          );
-          if (postIndex !== -1) {
-            user.facebookPosts[postIndex].selected = false;
-            post = user.facebookPosts[postIndex];
-            updated = true;
-          }
-        }
-        break;
-    }
-
-    if (updated) {
-      await user.save();
-      return res.status(200).json({
-        success: true,
-        message: `${platform} post deselected successfully`,
-        data: post,
-      });
-    } else {
-      return res.status(404).json({
-        success: false,
-        message: `${platform} post not found with the provided URL`,
-      });
-    }
-  } catch (error) {
-    console.error("Deselect post error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Error deselecting post",
-      error: error.message,
-    });
-  }
-});
-
-// Get selected posts for a specific platform
-router.get("/selected/:platform", protect, async (req, res) => {
-  try {
-    const { platform } = req.params;
-
-    // Validate platform
-    if (!["youtube", "tiktok", "instagram", "facebook"].includes(platform)) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Invalid platform. Must be youtube, tiktok, instagram, or facebook",
-      });
-    }
-
-    const user = req.user;
-    let selectedPosts = [];
-
-    // Get selected posts based on platform
-    switch (platform) {
-      case "youtube":
-        selectedPosts = user.youtubePosts.filter(
-          (post) => post.selected === true
-        );
-        break;
-      case "tiktok":
-        selectedPosts = user.tiktokPosts.filter(
-          (post) => post.selected === true
-        );
-        break;
-      case "instagram":
-        selectedPosts = user.instagramPosts.filter(
-          (post) => post.selected === true
-        );
-        break;
-      case "facebook":
-        selectedPosts = user.facebookPosts.filter(
-          (post) => post.selected === true
-        );
-        break;
-    }
-
-    // Sort posts by date, newest first
-    selectedPosts.sort((a, b) => new Date(b.addedAt) - new Date(a.addedAt));
-
-    return res.status(200).json({
-      success: true,
-      count: selectedPosts.length,
-      platform: platform,
-      data: selectedPosts,
-    });
-  } catch (error) {
-    console.error(
-      `Error fetching selected ${req.params.platform} posts:`,
-      error
-    );
-    return res.status(500).json({
-      success: false,
-      message: `Error fetching selected ${req.params.platform} posts`,
-      error: error.message,
-    });
-  }
-});
-
-// Get all selected posts from all platforms
-router.get("/selected", protect, async (req, res) => {
-  try {
-    const user = req.user;
-
-    // Get selected posts from each platform
-    const youtubePosts = user.youtubePosts
-      .filter((post) => post.selected === true)
-      .map((post) => ({
-        ...post.toObject(),
-        platform: "youtube",
-      }));
-
-    const tiktokPosts = user.tiktokPosts
-      .filter((post) => post.selected === true)
-      .map((post) => ({
-        ...post.toObject(),
-        platform: "tiktok",
-      }));
-
-    const instagramPosts = user.instagramPosts
-      .filter((post) => post.selected === true)
-      .map((post) => ({
-        ...post.toObject(),
-        platform: "instagram",
-      }));
-
-    const facebookPosts = user.facebookPosts
-      .filter((post) => post.selected === true)
-      .map((post) => ({
-        ...post.toObject(),
-        platform: "facebook",
-      }));
-
-    // Combine all selected posts
-    const allSelectedPosts = [
-      ...youtubePosts,
-      ...tiktokPosts,
-      ...instagramPosts,
-      ...facebookPosts,
-    ];
-
-    // Sort posts by date, newest first
-    allSelectedPosts.sort((a, b) => new Date(b.addedAt) - new Date(a.addedAt));
-
-    return res.status(200).json({
-      success: true,
-      count: allSelectedPosts.length,
-      data: allSelectedPosts,
-    });
-  } catch (error) {
-    console.error("Error fetching all selected posts:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Error fetching all selected posts",
-      error: error.message,
-    });
-  }
-});
-
-// Add a new route to update post details
-router.post("/post/update-details", protect, async (req, res) => {
-  try {
-    const { url, platform, title, description, productLink } = req.body;
 
     if (!url || !platform) {
       return res.status(400).json({
@@ -1693,118 +1393,475 @@ router.post("/post/update-details", protect, async (req, res) => {
       });
     }
 
-    const user = req.user;
-    let updated = false;
-    let post = null;
+    // Find and delete the post
+    const post = await Post.findOneAndDelete({
+      user: req.user._id,
+      url,
+      platform,
+    });
 
-    switch (platform) {
-      case "youtube":
-        {
-          const postIndex = user.youtubePosts.findIndex(
-            (post) => post.url === url
-          );
-          if (postIndex !== -1) {
-            // Only update the fields that are provided
-            if (title !== undefined) {
-              user.youtubePosts[postIndex].title = title;
-            }
-            if (description !== undefined) {
-              user.youtubePosts[postIndex].description = description;
-            }
-            if (productLink !== undefined) {
-              user.youtubePosts[postIndex].productLink = productLink;
-            }
-            post = user.youtubePosts[postIndex];
-            updated = true;
-          }
-        }
-        break;
-
-      case "tiktok":
-        {
-          const postIndex = user.tiktokPosts.findIndex(
-            (post) => post.url === url
-          );
-          if (postIndex !== -1) {
-            // Only update the fields that are provided
-            if (title !== undefined) {
-              user.tiktokPosts[postIndex].title = title;
-            }
-            if (description !== undefined) {
-              user.tiktokPosts[postIndex].description = description;
-            }
-            if (productLink !== undefined) {
-              user.tiktokPosts[postIndex].productLink = productLink;
-            }
-            post = user.tiktokPosts[postIndex];
-            updated = true;
-          }
-        }
-        break;
-
-      case "instagram":
-        {
-          const postIndex = user.instagramPosts.findIndex(
-            (post) => post.url === url
-          );
-          if (postIndex !== -1) {
-            // Only update the fields that are provided
-            if (title !== undefined) {
-              user.instagramPosts[postIndex].title = title;
-            }
-            if (description !== undefined) {
-              user.instagramPosts[postIndex].description = description;
-            }
-            if (productLink !== undefined) {
-              user.instagramPosts[postIndex].productLink = productLink;
-            }
-            post = user.instagramPosts[postIndex];
-            updated = true;
-          }
-        }
-        break;
-
-      case "facebook":
-        {
-          const postIndex = user.facebookPosts.findIndex(
-            (post) => post.url === url
-          );
-          if (postIndex !== -1) {
-            // Only update the fields that are provided
-            if (title !== undefined) {
-              user.facebookPosts[postIndex].title = title;
-            }
-            if (description !== undefined) {
-              user.facebookPosts[postIndex].description = description;
-            }
-            if (productLink !== undefined) {
-              user.facebookPosts[postIndex].productLink = productLink;
-            }
-            post = user.facebookPosts[postIndex];
-            updated = true;
-          }
-        }
-        break;
-    }
-
-    if (updated) {
-      await user.save();
-      return res.status(200).json({
-        success: true,
-        message: "Post details updated successfully",
-        data: post,
-      });
-    } else {
+    if (!post) {
       return res.status(404).json({
         success: false,
         message: "Post not found",
       });
     }
+
+    res.json({
+      success: true,
+      message: "Post deleted successfully",
+    });
   } catch (error) {
-    console.error("Error updating post details:", error);
-    return res.status(500).json({
+    console.error("Error deleting post:", error);
+    res.status(500).json({
       success: false,
-      message: "Error updating post details",
+      message: "Error deleting post",
+      error: error.message,
+    });
+  }
+});
+
+// Update post selected status
+router.patch("/post/selected", protect, async (req, res) => {
+  try {
+    const { url, platform, selected } = req.body;
+
+    if (!url || !platform || selected === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: "URL, platform, and selected status are required",
+      });
+    }
+
+    // Find and update the post
+    const post = await Post.findOneAndUpdate(
+      {
+        user: req.user._id,
+        url,
+        platform,
+      },
+      {
+        selected,
+      },
+      {
+        new: true,
+      }
+    );
+
+    if (!post) {
+      return res.status(404).json({
+        success: false,
+        message: "Post not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Post updated successfully",
+      data: post,
+    });
+  } catch (error) {
+    console.error("Error updating post:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating post",
+      error: error.message,
+    });
+  }
+});
+
+// Get selected posts
+router.get("/selected-posts", protect, async (req, res) => {
+  try {
+    const posts = await Post.find({
+      user: req.user._id,
+      selected: true,
+    })
+      .sort({ addedAt: -1 })
+      .lean();
+
+    // Group posts by platform
+    const groupedPosts = posts.reduce((acc, post) => {
+      if (!acc[post.platform]) {
+        acc[post.platform] = [];
+      }
+      acc[post.platform].push(post);
+      return acc;
+    }, {});
+
+    res.json({
+      success: true,
+      data: groupedPosts,
+    });
+  } catch (error) {
+    console.error("Error fetching selected posts:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching selected posts",
+      error: error.message,
+    });
+  }
+});
+
+// Update post product link
+router.patch("/post/product-link", protect, async (req, res) => {
+  try {
+    const { url, platform, productLink } = req.body;
+
+    if (!url || !platform || !productLink) {
+      return res.status(400).json({
+        success: false,
+        message: "URL, platform, and product link are required",
+      });
+    }
+
+    // Find and update the post
+    const post = await Post.findOneAndUpdate(
+      {
+        user: req.user._id,
+        url,
+        platform,
+      },
+      {
+        productLink,
+      },
+      {
+        new: true,
+      }
+    );
+
+    if (!post) {
+      return res.status(404).json({
+        success: false,
+        message: "Post not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Product link updated successfully",
+      data: post,
+    });
+  } catch (error) {
+    console.error("Error updating product link:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating product link",
+      error: error.message,
+    });
+  }
+});
+
+// Get posts with product links
+router.get("/posts-with-products", protect, async (req, res) => {
+  try {
+    const posts = await Post.find({
+      user: req.user._id,
+      productLink: { $exists: true, $ne: "" },
+    })
+      .sort({ addedAt: -1 })
+      .lean();
+
+    // Group posts by platform
+    const groupedPosts = posts.reduce((acc, post) => {
+      if (!acc[post.platform]) {
+        acc[post.platform] = [];
+      }
+      acc[post.platform].push(post);
+      return acc;
+    }, {});
+
+    res.json({
+      success: true,
+      data: groupedPosts,
+    });
+  } catch (error) {
+    console.error("Error fetching posts with products:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching posts with products",
+      error: error.message,
+    });
+  }
+});
+
+// Get posts by date range
+router.get("/posts-by-date", protect, async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({
+        success: false,
+        message: "Start date and end date are required",
+      });
+    }
+
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid date format",
+      });
+    }
+
+    const posts = await Post.find({
+      user: req.user._id,
+      addedAt: {
+        $gte: start,
+        $lte: end,
+      },
+    })
+      .sort({ addedAt: -1 })
+      .lean();
+
+    // Group posts by platform
+    const groupedPosts = posts.reduce((acc, post) => {
+      if (!acc[post.platform]) {
+        acc[post.platform] = [];
+      }
+      acc[post.platform].push(post);
+      return acc;
+    }, {});
+
+    res.json({
+      success: true,
+      data: groupedPosts,
+    });
+  } catch (error) {
+    console.error("Error fetching posts by date range:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching posts by date range",
+      error: error.message,
+    });
+  }
+});
+
+// Get posts by search term
+router.get("/posts/search", protect, async (req, res) => {
+  try {
+    const { searchTerm } = req.query;
+
+    if (!searchTerm) {
+      return res.status(400).json({
+        success: false,
+        message: "Search term is required",
+      });
+    }
+
+    const posts = await Post.find({
+      user: req.user._id,
+      $or: [
+        { title: { $regex: searchTerm, $options: "i" } },
+        { description: { $regex: searchTerm, $options: "i" } },
+        { caption: { $regex: searchTerm, $options: "i" } },
+      ],
+    })
+      .sort({ addedAt: -1 })
+      .lean();
+
+    // Group posts by platform
+    const groupedPosts = posts.reduce((acc, post) => {
+      if (!acc[post.platform]) {
+        acc[post.platform] = [];
+      }
+      acc[post.platform].push(post);
+      return acc;
+    }, {});
+
+    res.json({
+      success: true,
+      data: groupedPosts,
+    });
+  } catch (error) {
+    console.error("Error searching posts:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error searching posts",
+      error: error.message,
+    });
+  }
+});
+
+// Get posts by platform and date range
+router.get("/posts/:platform/by-date", protect, async (req, res) => {
+  try {
+    const { platform } = req.params;
+    const { startDate, endDate } = req.query;
+
+    // Validate platform
+    const validPlatforms = ["youtube", "tiktok", "instagram", "facebook"];
+    if (!validPlatforms.includes(platform)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Invalid platform. Must be one of: youtube, tiktok, instagram, facebook",
+      });
+    }
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({
+        success: false,
+        message: "Start date and end date are required",
+      });
+    }
+
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid date format",
+      });
+    }
+
+    const posts = await Post.find({
+      user: req.user._id,
+      platform,
+      addedAt: {
+        $gte: start,
+        $lte: end,
+      },
+    })
+      .sort({ addedAt: -1 })
+      .lean();
+
+    res.json({
+      success: true,
+      data: posts,
+    });
+  } catch (error) {
+    console.error("Error fetching posts by platform and date range:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching posts by platform and date range",
+      error: error.message,
+    });
+  }
+});
+
+// Get posts by platform and search term
+router.get("/posts/:platform/search", protect, async (req, res) => {
+  try {
+    const { platform } = req.params;
+    const { searchTerm } = req.query;
+
+    // Validate platform
+    const validPlatforms = ["youtube", "tiktok", "instagram", "facebook"];
+    if (!validPlatforms.includes(platform)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Invalid platform. Must be one of: youtube, tiktok, instagram, facebook",
+      });
+    }
+
+    if (!searchTerm) {
+      return res.status(400).json({
+        success: false,
+        message: "Search term is required",
+      });
+    }
+
+    const posts = await Post.find({
+      user: req.user._id,
+      platform,
+      $or: [
+        { title: { $regex: searchTerm, $options: "i" } },
+        { description: { $regex: searchTerm, $options: "i" } },
+        { caption: { $regex: searchTerm, $options: "i" } },
+      ],
+    })
+      .sort({ addedAt: -1 })
+      .lean();
+
+    res.json({
+      success: true,
+      data: posts,
+    });
+  } catch (error) {
+    console.error("Error searching posts by platform:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error searching posts by platform",
+      error: error.message,
+    });
+  }
+});
+
+// Get posts by platform and product link
+router.get("/posts/:platform/with-products", protect, async (req, res) => {
+  try {
+    const { platform } = req.params;
+
+    // Validate platform
+    const validPlatforms = ["youtube", "tiktok", "instagram", "facebook"];
+    if (!validPlatforms.includes(platform)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Invalid platform. Must be one of: youtube, tiktok, instagram, facebook",
+      });
+    }
+
+    const posts = await Post.find({
+      user: req.user._id,
+      platform,
+      productLink: { $exists: true, $ne: "" },
+    })
+      .sort({ addedAt: -1 })
+      .lean();
+
+    res.json({
+      success: true,
+      data: posts,
+    });
+  } catch (error) {
+    console.error("Error fetching posts with products by platform:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching posts with products by platform",
+      error: error.message,
+    });
+  }
+});
+
+// Get posts by platform and selected status
+router.get("/posts/:platform/selected", protect, async (req, res) => {
+  try {
+    const { platform } = req.params;
+
+    // Validate platform
+    const validPlatforms = ["youtube", "tiktok", "instagram", "facebook"];
+    if (!validPlatforms.includes(platform)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Invalid platform. Must be one of: youtube, tiktok, instagram, facebook",
+      });
+    }
+
+    const posts = await Post.find({
+      user: req.user._id,
+      platform,
+      selected: true,
+    })
+      .sort({ addedAt: -1 })
+      .lean();
+
+    res.json({
+      success: true,
+      data: posts,
+    });
+  } catch (error) {
+    console.error("Error fetching selected posts by platform:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching selected posts by platform",
       error: error.message,
     });
   }
