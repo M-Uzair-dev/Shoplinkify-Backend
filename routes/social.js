@@ -70,6 +70,7 @@ const setCachedImage = (url, imageUrl) => {
 router.get("/clicks", protect, async (req, res) => {
   try {
     const clicks = await Click.find({ user: req.user._id });
+
     const result = {
       instagram: [],
       facebook: [],
@@ -77,7 +78,6 @@ router.get("/clicks", protect, async (req, res) => {
       tiktok: [],
     };
 
-    // Helper object to organize data before formatting
     const grouped = {
       instagram: {},
       facebook: {},
@@ -85,24 +85,55 @@ router.get("/clicks", protect, async (req, res) => {
       tiktok: {},
     };
 
-    // Group clicks by platform and then by week
+    // Initialize counters
+    const totalData = {
+      instaTotal: 0,
+      fbTotal: 0,
+      ytTotal: 0,
+      tikTotal: 0,
+    };
+
+    const clicksData = {
+      desktopClicks: 0,
+      phoneClicks: 0,
+    };
+
+    const countryData = {};
+
+    // Process each click
     clicks.forEach((click) => {
-      const { platform, date } = click;
+      const { platform, date, device, country } = click;
       const weekStart = dayjs(date).startOf("isoWeek").format("YYYY-MM-DD");
 
+      // Weekly grouping
       if (!grouped[platform]) grouped[platform] = {};
       if (!grouped[platform][weekStart]) grouped[platform][weekStart] = 0;
-
       grouped[platform][weekStart]++;
+
+      // Total counts
+      if (platform === "instagram") totalData.instaTotal++;
+      if (platform === "facebook") totalData.fbTotal++;
+      if (platform === "youtube") totalData.ytTotal++;
+      if (platform === "tiktok") totalData.tikTotal++;
+
+      // Device stats
+      if (device === "mobile") clicksData.phoneClicks++;
+      else clicksData.desktopClicks++;
+
+      // Country stats
+      if (country) {
+        if (!countryData[country]) countryData[country] = 0;
+        countryData[country]++;
+      }
     });
 
-    // Transform grouped data into desired array format
+    // Convert weekly grouped data into arrays
     Object.keys(grouped).forEach((platform) => {
       const weeks = grouped[platform];
       const weeklyClicks = [];
 
       Object.keys(weeks)
-        .sort() // sort weeks chronologically
+        .sort()
         .forEach((weekStart) => {
           weeklyClicks.push({
             weekStart,
@@ -113,9 +144,22 @@ router.get("/clicks", protect, async (req, res) => {
       result[platform] = weeklyClicks;
     });
 
+    const clicksDataPercentage = {
+      desktopClicks:
+        (clicksData.desktopClicks /
+          (clicksData.desktopClicks + clicksData.phoneClicks)) *
+        100,
+      phoneClicks:
+        (clicksData.phoneClicks /
+          (clicksData.desktopClicks + clicksData.phoneClicks)) *
+        100,
+    };
     res.json({
       success: true,
       data: result,
+      totalData,
+      clicksData: clicksDataPercentage,
+      countryData,
     });
   } catch (error) {
     console.error("Error organizing clicks:", error);
@@ -740,7 +784,6 @@ const extractFacebookImageUrl = async (url) => {
       ) ||
       html.match(/<img[^>]*id="[^"]*fbImage[^"]*"[^>]*src="([^"]*)"[^>]*>/i) ||
       html.match(/<img[^>]*data-src="([^"]*)"[^>]*>/i);
-
     if (imgTagMatches && imgTagMatches[1]) {
       console.log("Found Facebook image from img tag:", imgTagMatches[1]);
       return imgTagMatches[1];
@@ -918,6 +961,7 @@ router.post("/tiktok", protect, async (req, res) => {
           videoPath: videoPath,
           extractionMethod: "tikwm_api_simplified",
           message: "TikTok video added successfully",
+          _id: post._id,
         });
       } else {
         throw new Error("Invalid response format from TikWm API");
@@ -2047,6 +2091,56 @@ router.get("/proxy/image", async (req, res) => {
     }
 
     return res.redirect(fallbackImage);
+  }
+});
+
+// Get total clicks by platform
+
+// Update post details
+router.post("/post/update-details", protect, async (req, res) => {
+  try {
+    const { postId, title, description, productLink } = req.body;
+
+    if (!postId) {
+      return res.status(400).json({
+        success: false,
+        message: "Post ID is required",
+      });
+    }
+
+    // Find and update the post, ensuring it belongs to the user
+    const updatedPost = await Post.findOneAndUpdate(
+      {
+        _id: postId,
+        user: req.user._id,
+      },
+      {
+        title,
+        description,
+        productLink,
+      },
+      { new: true }
+    );
+
+    if (!updatedPost) {
+      return res.status(404).json({
+        success: false,
+        message: "Post not found or unauthorized",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Post details updated successfully",
+      data: updatedPost,
+    });
+  } catch (error) {
+    console.error("Error updating post details:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating post details",
+      error: error.message,
+    });
   }
 });
 
