@@ -205,6 +205,66 @@ router.get("/post/details", protect, async (req, res) => {
       });
     }
 
+    // For TikTok posts, check if the existing video URL is accessible
+    if (platform === "tiktok" && post.videoPath) {
+      try {
+        // Try to access the existing video URL with proper headers
+        const response = await axios.get(post.videoPath, {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            Accept: "video/mp4,video/*;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            Referer: "https://www.tiktok.com/",
+            Origin: "https://www.tiktok.com",
+            "Sec-Fetch-Dest": "video",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "cross-site",
+          },
+          validateStatus: function (status) {
+            return status < 500; // Accept all status codes less than 500
+          },
+          maxRedirects: 5,
+          timeout: 5000,
+        });
+        console.log(response);
+        if (
+          response.status === 403 ||
+          !response.headers["content-type"]?.includes("video")
+        ) {
+          console.log("TikTok video URL check failed, fetching fresh URL.");
+          const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(
+            url
+          )}`;
+          const freshResponse = await axios.get(tikwmUrl);
+
+          if (freshResponse.data && freshResponse.data.data) {
+            // Update the post with the fresh video URL
+            post.videoPath = freshResponse.data.data.wmplay || post.videoPath;
+            console.log("Updated TikTok video URL.");
+          }
+        }
+      } catch (error) {
+        console.error("Error checking TikTok video URL:", error);
+        // If there's an error checking the URL, fetch a fresh one
+        try {
+          console.log("Error checking video URL, fetching fresh URL.");
+          const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(
+            url
+          )}`;
+          const freshResponse = await axios.get(tikwmUrl);
+
+          if (freshResponse.data && freshResponse.data.data) {
+            post.videoPath = freshResponse.data.data.wmplay || post.videoPath;
+            console.log("Updated TikTok video URL after error.");
+          }
+        } catch (freshError) {
+          console.error("Error fetching fresh TikTok video URL:", freshError);
+          // Continue with the existing videoPath if fetching fails
+        }
+      }
+    }
+
     await Click.create({
       user: req.user._id,
       post: post._id,
@@ -694,6 +754,7 @@ router.post("/instagram", protect, async (req, res) => {
         url: postUrl,
         imageUrl: imageUrl,
         extractionMethod: extractionMethod,
+        _id: post._id,
         message: "Instagram post image added successfully",
       });
     } catch (error) {
@@ -718,12 +779,10 @@ router.post("/instagram", protect, async (req, res) => {
 // Helper function to extract Facebook image URL
 const extractFacebookImageUrl = async (url) => {
   try {
-    console.log("Extracting Facebook image from URL:", url);
+    console.log("Starting Facebook image extraction for URL:", url);
 
-    // First try to get the image from the Open Graph meta tags
-    const response = await axios({
-      method: "get",
-      url: url,
+    // First try to get the image from the meta tags
+    const response = await axios.get(url, {
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
@@ -735,150 +794,274 @@ const extractFacebookImageUrl = async (url) => {
         DNT: "1",
         Connection: "keep-alive",
         "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
       },
       timeout: 10000,
       maxRedirects: 5,
     });
 
     const html = response.data;
+    console.log("Successfully fetched Facebook page HTML");
 
-    // Try to extract image from Open Graph meta tags
-    const ogImageMatch = html.match(
-      /<meta[^>]*property="og:image"[^>]*content="([^"]*)"[^>]*>/i
+    // Try to find the image URL in meta tags first
+    const metaImageMatch = html.match(
+      /<meta[^>]*property="og:image"[^>]*content="([^"]*)"/i
     );
-    if (ogImageMatch && ogImageMatch[1]) {
-      console.log("Found Facebook image from OG meta tag:", ogImageMatch[1]);
-      return ogImageMatch[1];
+    if (metaImageMatch && metaImageMatch[1]) {
+      const imageUrl = metaImageMatch[1].replace(/&amp;/g, "&");
+      console.log("Found image URL in meta tags:", imageUrl);
+      return imageUrl;
     }
 
-    // Try to extract image from Twitter card meta tags
-    const twitterImageMatch = html.match(
-      /<meta[^>]*name="twitter:image"[^>]*content="([^"]*)"[^>]*>/i
+    // If meta tag not found, try to find the image in the HTML content
+    const imageMatch = html.match(
+      /<img[^>]*src="([^"]*)"[^>]*class="[^"]*scaledImageFitWidth[^"]*"/i
     );
-    if (twitterImageMatch && twitterImageMatch[1]) {
-      console.log(
-        "Found Facebook image from Twitter meta tag:",
-        twitterImageMatch[1]
-      );
-      return twitterImageMatch[1];
+    if (imageMatch && imageMatch[1]) {
+      const imageUrl = imageMatch[1].replace(/&amp;/g, "&");
+      console.log("Found image URL in HTML content:", imageUrl);
+      return imageUrl;
     }
 
-    // Try to extract image from structured data
-    const structuredDataMatch = html.match(/"image":\s*"([^"]+)"/i);
-    if (structuredDataMatch && structuredDataMatch[1]) {
-      console.log(
-        "Found Facebook image from structured data:",
-        structuredDataMatch[1]
-      );
-      return structuredDataMatch[1];
+    // If still not found, try to find any image with specific Facebook classes
+    const fallbackImageMatch = html.match(
+      /<img[^>]*src="([^"]*)"[^>]*class="[^"]*x1ey2m1c[^"]*"/i
+    );
+    if (fallbackImageMatch && fallbackImageMatch[1]) {
+      const imageUrl = fallbackImageMatch[1].replace(/&amp;/g, "&");
+      console.log("Found fallback image URL:", imageUrl);
+      return imageUrl;
     }
 
-    // Try to extract image from img tags with specific classes or IDs
-    const imgTagMatches =
-      html.match(
-        /<img[^>]*class="[^"]*scaledImage[^"]*"[^>]*src="([^"]*)"[^>]*>/i
-      ) ||
-      html.match(/<img[^>]*id="[^"]*fbImage[^"]*"[^>]*src="([^"]*)"[^>]*>/i) ||
-      html.match(/<img[^>]*data-src="([^"]*)"[^>]*>/i);
-    if (imgTagMatches && imgTagMatches[1]) {
-      console.log("Found Facebook image from img tag:", imgTagMatches[1]);
-      return imgTagMatches[1];
-    }
-
-    // If all else fails, try to extract any image URL from the page
+    // Try to find any image URL in the page
     const anyImageMatch = html.match(
       /https:\/\/[^"']*\.(?:jpg|jpeg|png|gif|webp)[^"']*/i
     );
     if (anyImageMatch) {
-      console.log(
-        "Found Facebook image from general pattern:",
-        anyImageMatch[0]
-      );
-      return anyImageMatch[0];
+      const imageUrl = anyImageMatch[0].replace(/&amp;/g, "&");
+      console.log("Found general image URL:", imageUrl);
+      return imageUrl;
     }
 
-    console.log("No Facebook image found in the page");
+    console.log("No suitable image URL found in the Facebook post");
     return null;
   } catch (error) {
-    console.error("Error extracting Facebook image:", error.message);
+    console.error("Error extracting Facebook image URL:", error.message);
+    if (error.response) {
+      console.error("Response status:", error.response.status);
+      console.error("Response headers:", error.response.headers);
+    }
     return null;
   }
 };
 
-// Update the Facebook post route
 router.post("/facebook", protect, async (req, res) => {
   try {
-    const { url } = req.body;
+    const { url: postUrl } = req.body;
 
-    if (!url) {
+    if (!postUrl) {
       return res.status(400).json({
         success: false,
-        message: "URL is required",
+        message: "Post URL is required in the request body",
       });
     }
 
-    // Validate URL format
-    if (!url.includes("facebook.com")) {
+    if (
+      !/^https?:\/\/(www\.)?(facebook|fb)\.com\/[a-zA-Z0-9.]+\/posts\/|^https?:\/\/(www\.)?(facebook|fb)\.com\/[a-zA-Z0-9.]+\/photos\/|^https?:\/\/(www\.)?(facebook|fb)\.com\/share\/[pv]\/[a-zA-Z0-9_-]+\/?|^https?:\/\/(www\.)?(facebook|fb)\.com\/[a-zA-Z0-9.]+\/videos\/[0-9]+\/?/.test(
+        postUrl
+      )
+    ) {
       return res.status(400).json({
         success: false,
-        message: "Invalid Facebook URL",
+        message:
+          "Invalid Facebook URL. Must be a post, photo, video, or share URL",
       });
     }
 
-    // Check if post already exists
-    const existingPost = await Post.findOne({
-      userId: req.user._id,
-      url: url,
-      platform: "facebook",
-    });
-
-    if (existingPost) {
-      return res.status(400).json({
-        success: false,
-        message: "This Facebook post has already been added",
-      });
-    }
-
-    // Extract image URL
-    let imageUrl = null;
     try {
-      imageUrl = await extractFacebookImageUrl(url);
-      console.log("Extracted Facebook image URL:", imageUrl);
+      const headers = {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        Referer: "https://www.facebook.com/",
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
+        DNT: "1",
+        Connection: "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "sec-ch-ua":
+          '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+      };
+
+      console.log("Attempting to fetch Facebook content from:", postUrl);
+      const { data } = await axios.get(postUrl, {
+        headers: headers,
+        timeout: 15000,
+        maxRedirects: 5,
+        validateStatus: function (status) {
+          return status >= 200 && status < 500; // Accept all status codes less than 500
+        },
+      });
+
+      console.log("Successfully fetched Facebook page HTML");
+      const $ = cheerio.load(data);
+
+      let imageUrl = $('meta[property="og:image"]').attr("content");
+      let extractionMethod = "og_image";
+
+      if (!imageUrl) {
+        imageUrl =
+          $('meta[property="og:image:secure_url"]').attr("content") ||
+          $('meta[property="twitter:image"]').attr("content");
+        extractionMethod = "alternative_meta";
+      }
+
+      if (!imageUrl) {
+        if (postUrl.includes("/share/p/")) {
+          const possibleImages = $("img")
+            .filter(function () {
+              const src = $(this).attr("src");
+              return (
+                src &&
+                (src.includes("fbcdn.net") ||
+                  src.includes("scontent") ||
+                  src.includes("facebook.com/safe_image.php"))
+              );
+            })
+            .map(function () {
+              return $(this).attr("src");
+            })
+            .get();
+
+          if (possibleImages.length > 0) {
+            imageUrl = possibleImages[0];
+            for (const img of possibleImages) {
+              if (img.includes("_n.") || img.includes("_o.")) {
+                imageUrl = img;
+                break;
+              }
+            }
+            extractionMethod = "html_image";
+          }
+        }
+      }
+
+      if (!imageUrl) {
+        const scripts = $('script[type="application/ld+json"]')
+          .map(function () {
+            return $(this).html();
+          })
+          .get();
+
+        for (const script of scripts) {
+          try {
+            const ldJson = JSON.parse(script);
+            if (ldJson.image) {
+              if (Array.isArray(ldJson.image)) {
+                imageUrl = ldJson.image[0];
+              } else {
+                imageUrl = ldJson.image;
+              }
+              extractionMethod = "json_ld";
+              break;
+            }
+          } catch (e) {}
+        }
+      }
+
+      if (!imageUrl) {
+        const fbcdnPattern =
+          /https:\/\/[a-z0-9-]+\.fbcdn\.net\/[a-z0-9_\/.]+\.(?:jpg|jpeg|png|gif)/gi;
+        const matches = data.match(fbcdnPattern);
+        if (matches && matches.length > 0) {
+          imageUrl = matches[0];
+          extractionMethod = "regex_match";
+        }
+      }
+
+      if (!imageUrl) {
+        if (postUrl.includes("/share/p/")) {
+          const postIdMatch = postUrl.match(/\/share\/p\/([a-zA-Z0-9_-]+)/);
+          if (postIdMatch && postIdMatch[1]) {
+            imageUrl =
+              "https://static.xx.fbcdn.net/rsrc.php/v3/y4/r/-PAXP-deijE.gif";
+            extractionMethod = "fallback_share";
+          }
+        }
+      }
+
+      if (!imageUrl) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "Could not find image for the Facebook post. This might be due to privacy settings or Facebook's anti-scraping measures.",
+        });
+      }
+
+      try {
+        console.log("Verifying Facebook image accessibility:", imageUrl);
+        await axios.head(imageUrl, {
+          timeout: 5000,
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+            Referer: "https://www.facebook.com/",
+          },
+        });
+        console.log("Facebook image is accessible");
+      } catch (error) {
+        console.log(
+          "Warning: Facebook image may not be directly accessible:",
+          error.message
+        );
+      }
+
+      console.log(`Final Facebook image (via ${extractionMethod}):`, imageUrl);
+
+      const post = await Post.create({
+        user: req.user._id,
+        platform: "facebook",
+        url: postUrl,
+        imageUrl: imageUrl,
+        title: "",
+        description: "",
+      });
+
+      return res.status(200).json({
+        success: true,
+        platform: "facebook",
+        url: postUrl,
+        imageUrl: imageUrl,
+        extractionMethod,
+        message: "Facebook post image added successfully",
+        _id: post._id,
+      });
     } catch (error) {
-      console.error("Error extracting Facebook image:", error);
-      // Continue without image
+      console.error("Facebook scraping error:", error);
+      return res.status(404).json({
+        success: false,
+        message:
+          "Error accessing Facebook post. It may be private or not publicly accessible.",
+        error: error.message,
+      });
     }
-
-    // Create new post
-    const newPost = new Post({
-      userId: req.user._id,
-      platform: "facebook",
-      url: url,
-      imageUrl: imageUrl,
-      addedAt: new Date(),
-    });
-
-    await newPost.save();
-
-    return res.status(201).json({
-      success: true,
-      message: "Facebook post added successfully",
-      post: newPost,
-    });
   } catch (error) {
-    console.error("Error adding Facebook post:", error);
+    console.error("Facebook API error:", error);
     return res.status(500).json({
       success: false,
-      message: "Error adding Facebook post",
+      message: "Error fetching Facebook image",
       error: error.message,
     });
   }
 });
-
 // TikTok video details endpoint
 router.post("/tiktok", protect, async (req, res) => {
   try {
