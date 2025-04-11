@@ -7,6 +7,7 @@ const {
   getMe,
   forgotPassword,
   resetPassword,
+  userCount,
 } = require("../controllers/authController");
 const { protect } = require("../middleware/auth");
 
@@ -56,5 +57,7 @@ router.put(
   ],
   resetPassword
 );
+
+router.get("/userCount", userCount);
 
 module.exports = router;

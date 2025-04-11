@@ -198,3 +198,7 @@ exports.resetPassword = async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 };
+exports.userCount = async (req, res) => {
+  const userCount = await User.countDocuments();
+  res.json({ userCount });
+};
