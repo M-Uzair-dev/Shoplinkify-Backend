@@ -9,6 +9,13 @@ const { protect } = require("../middleware/auth");
 const Click = require("../models/click");
 const dayjs = require("dayjs");
 const isoWeek = require("dayjs/plugin/isoWeek");
+const uploadFile = require("../utils/uploadFile");
+const fs = require("fs");
+const path = require("path");
+const { promisify } = require("util");
+const stream = require("stream");
+const pipeline = promisify(stream.pipeline);
+// ... existing code ...
 dayjs.extend(isoWeek); // Enables week-based calculations
 
 // Add these utility functions at the top of the file after the imports
@@ -406,6 +413,7 @@ router.post("/youtube", protect, async (req, res) => {
         description: snippet.description || "",
         embedCode: embedCode,
         message: "YouTube video added successfully",
+        _id: post._id,
       });
     } catch (error) {
       console.error("YouTube API error:", error.message);
@@ -1062,7 +1070,7 @@ router.post("/facebook", protect, async (req, res) => {
     });
   }
 });
-// TikTok video details endpoint
+
 router.post("/tiktok", protect, async (req, res) => {
   try {
     const { url: videoUrl } = req.body;
@@ -1117,16 +1125,78 @@ router.post("/tiktok", protect, async (req, res) => {
           videoPath,
         });
 
+        // Download and upload thumbnail to Cloudinary
+        let cloudinaryThumbnailUrl = "";
+        let cloudinaryUserImageUrl = "";
+        if (thumbnailUrl) {
+          try {
+            // Download the image
+            const response = await axios({
+              method: "GET",
+              url: thumbnailUrl,
+              responseType: "arraybuffer",
+            });
+
+            // Upload to Cloudinary using the buffer directly
+            cloudinaryThumbnailUrl = await uploadFile(
+              Buffer.from(response.data),
+              () => {}
+            );
+
+            console.log(
+              "Successfully uploaded thumbnail to Cloudinary:",
+              cloudinaryThumbnailUrl
+            );
+          } catch (uploadError) {
+            console.error(
+              "Error uploading thumbnail to Cloudinary:",
+              uploadError
+            );
+            // Fallback to original thumbnail URL if Cloudinary upload fails
+            cloudinaryThumbnailUrl = thumbnailUrl;
+          }
+        }
+
+        // Upload userImage to Cloudinary if available
+        if (userImage) {
+          try {
+            // Download the image
+            const response = await axios({
+              method: "GET",
+              url: userImage,
+              responseType: "arraybuffer",
+            });
+
+            // Upload to Cloudinary using the buffer directly
+            cloudinaryUserImageUrl = await uploadFile(
+              Buffer.from(response.data),
+              () => {}
+            );
+
+            console.log(
+              "Successfully uploaded user image to Cloudinary:",
+              cloudinaryUserImageUrl
+            );
+          } catch (uploadError) {
+            console.error(
+              "Error uploading user image to Cloudinary:",
+              uploadError
+            );
+            // Fallback to original userImage URL if Cloudinary upload fails
+            cloudinaryUserImageUrl = userImage;
+          }
+        }
+
         // Create new post using Post model
         const post = await Post.create({
           user: req.user._id,
           platform: "tiktok",
           url: videoUrl,
-          thumbnailUrl: thumbnailUrl,
+          thumbnailUrl: cloudinaryThumbnailUrl || thumbnailUrl,
           caption: caption,
           videoId: videoId,
           username: username,
-          userImage: userImage,
+          userImage: cloudinaryUserImageUrl || userImage,
           videoPath: videoPath,
           title: caption || "",
           description: "",
@@ -1136,11 +1206,11 @@ router.post("/tiktok", protect, async (req, res) => {
           success: true,
           platform: "tiktok",
           url: videoUrl,
-          thumbnailUrl: thumbnailUrl,
+          thumbnailUrl: cloudinaryThumbnailUrl || thumbnailUrl,
           title: caption,
           videoId: videoId,
           username: username,
-          userImage: userImage,
+          userImage: cloudinaryUserImageUrl || userImage,
           videoPath: videoPath,
           extractionMethod: "tikwm_api_simplified",
           message: "TikTok video added successfully",
@@ -1173,6 +1243,36 @@ router.post("/tiktok", protect, async (req, res) => {
         let caption =
           $('meta[property="og:description"]').attr("content") || "";
 
+        let cloudinaryThumbnailUrl = "";
+        if (thumbnailUrl) {
+          try {
+            // Download the image
+            const response = await axios({
+              method: "GET",
+              url: thumbnailUrl,
+              responseType: "arraybuffer",
+            });
+
+            // Upload to Cloudinary using the buffer directly
+            cloudinaryThumbnailUrl = await uploadFile(
+              Buffer.from(response.data),
+              () => {}
+            );
+
+            console.log(
+              "Successfully uploaded thumbnail to Cloudinary:",
+              cloudinaryThumbnailUrl
+            );
+          } catch (uploadError) {
+            console.error(
+              "Error uploading thumbnail to Cloudinary:",
+              uploadError
+            );
+            // Fallback to original thumbnail URL if Cloudinary upload fails
+            cloudinaryThumbnailUrl = thumbnailUrl;
+          }
+        }
+
         if (thumbnailUrl) {
           console.log(
             "Successfully extracted thumbnail via Open Graph tags:",
@@ -1184,7 +1284,7 @@ router.post("/tiktok", protect, async (req, res) => {
             user: req.user._id,
             platform: "tiktok",
             url: videoUrl,
-            thumbnailUrl: thumbnailUrl,
+            thumbnailUrl: cloudinaryThumbnailUrl || thumbnailUrl,
             caption: caption,
           });
 
@@ -1192,7 +1292,7 @@ router.post("/tiktok", protect, async (req, res) => {
             success: true,
             platform: "tiktok",
             url: videoUrl,
-            thumbnailUrl: thumbnailUrl,
+            thumbnailUrl: cloudinaryThumbnailUrl || thumbnailUrl,
             caption: caption,
             extractionMethod: "opengraph",
             message: "TikTok video added successfully with OG tags",

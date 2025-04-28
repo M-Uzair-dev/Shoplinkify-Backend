@@ -15,6 +15,7 @@
     "axios": "^1.6.8",
     "bcryptjs": "^3.0.2",
     "cheerio": "^1.0.0",
+    "cloudinary": "^2.6.0",
     "cors": "^2.8.5",
     "dayjs": "^1.11.13",
     "dotenv": "^16.4.7",
