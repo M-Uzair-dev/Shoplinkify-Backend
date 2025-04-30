@@ -177,9 +177,9 @@ router.get("/clicks", protect, async (req, res) => {
   }
 });
 
-router.get("/post/details", protect, async (req, res) => {
+router.get("/post/details", async (req, res) => {
   try {
-    const { url, platform } = req.query;
+    const { url, platform, userId } = req.query;
 
     if (!url || !platform) {
       return res.status(400).json({
@@ -200,7 +200,7 @@ router.get("/post/details", protect, async (req, res) => {
 
     // Find the post
     const post = await Post.findOne({
-      user: req.user._id,
+      user: userId,
       url,
       platform,
     }).lean();
@@ -273,7 +273,7 @@ router.get("/post/details", protect, async (req, res) => {
     }
 
     await Click.create({
-      user: req.user._id,
+      user: userId,
       post: post._id,
       country: req.query.country,
       platform: platform,
