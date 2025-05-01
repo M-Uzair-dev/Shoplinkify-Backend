@@ -1669,7 +1669,11 @@ router.get("/posts/all", protect, async (req, res) => {
   try {
     const user = req.user;
     const { selectedPlatforms, feedSettings } = user;
-    const postsCount = parseInt(feedSettings?.postsCount || "6");
+
+    // Allow overriding the posts count via query parameter
+    const postsCount = req.query.count
+      ? parseInt(req.query.count)
+      : parseInt(feedSettings?.postsCount || "6");
 
     let platforms = [];
     if (selectedPlatforms.instagram) platforms.push("instagram");
@@ -2302,8 +2306,9 @@ router.get("/proxy/image", async (req, res) => {
     res.setHeader("Cache-Control", "public, max-age=86400"); // Cache for a day
     res.setHeader("Access-Control-Allow-Origin", "*"); // Allow cross-origin access
 
-    // Cache the successful image URL
-    setCachedImage(url, url);
+    // Add a unique identifier to the cached URL to avoid conflicts
+    // We don't actually modify the URL, we're just not caching it
+    // Because we're directly streaming the response, there's no need to cache
 
     // Send the image data
     res.send(response.data);

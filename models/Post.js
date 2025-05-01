@@ -31,7 +31,7 @@ const postSchema = new mongoose.Schema(
     },
     selected: {
       type: Boolean,
-      default: false,
+      default: true,
     },
     // Platform specific fields
     // YouTube specific
