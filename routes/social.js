@@ -15,6 +15,7 @@ const path = require("path");
 const { promisify } = require("util");
 const stream = require("stream");
 const pipeline = promisify(stream.pipeline);
+const cloudinary = require("cloudinary").v2;
 // ... existing code ...
 dayjs.extend(isoWeek); // Enables week-based calculations
 
@@ -443,7 +444,10 @@ router.post("/instagram", protect, async (req, res) => {
   try {
     const { url: postUrl, embedCode } = req.body;
 
+    console.log("📷 Instagram upload request received for URL:", postUrl);
+
     if (!postUrl) {
+      console.log("❌ Error: Missing post URL in request body");
       return res.status(400).json({
         success: false,
         message: "Post URL is required in the request body",
@@ -459,6 +463,7 @@ router.post("/instagram", protect, async (req, res) => {
 
     // If URL is actually an embed code, extract the URL from it
     if (isEmbedCode) {
+      console.log("📝 Detected embed code in URL field, extracting actual URL");
       originalEmbedCode = postUrl;
       const urlMatch = postUrl.match(
         /https:\/\/www\.instagram\.com\/p\/[^\/'"]+/
@@ -466,9 +471,11 @@ router.post("/instagram", protect, async (req, res) => {
       if (urlMatch) {
         processedUrl = urlMatch[0];
         console.log(
-          "Extracted Instagram URL from embed code in URL field:",
+          "✅ Extracted Instagram URL from embed code:",
           processedUrl
         );
+      } else {
+        console.log("❌ Failed to extract URL from embed code");
       }
     }
     // If the separate embed code is provided and URL is not an embed code
@@ -478,7 +485,7 @@ router.post("/instagram", protect, async (req, res) => {
       embedCode.includes("instagram-media")
     ) {
       originalEmbedCode = embedCode;
-      console.log("Using provided embed code");
+      console.log("📝 Using provided embed code");
 
       // Try to extract URL from embed code if URL looks invalid
       if (!processedUrl.includes("instagram.com")) {
@@ -488,9 +495,11 @@ router.post("/instagram", protect, async (req, res) => {
         if (urlMatch) {
           processedUrl = urlMatch[0];
           console.log(
-            "Extracted Instagram URL from embed code field:",
+            "✅ Extracted Instagram URL from embed code field:",
             processedUrl
           );
+        } else {
+          console.log("❌ Failed to extract URL from embed code field");
         }
       }
     }
@@ -503,9 +512,24 @@ router.post("/instagram", protect, async (req, res) => {
       if (shortcodeMatch && shortcodeMatch[2]) {
         const shortcode = shortcodeMatch[2];
 
-        processedUrl = `https://www.instagram.com/p/${shortcode}/embed/`;
-        console.log("Converted to Instagram embed URL:", processedUrl);
+        // IMPORTANT CHANGE: Don't use embed URL, use direct post URL
+        // Using embed URLs might lead to profile images instead of post images
+        // processedUrl = `https://www.instagram.com/p/${shortcode}/embed/`;
+        processedUrl = `https://www.instagram.com/p/${shortcode}/`;
+        console.log(
+          "🔄 Using direct Instagram post URL instead of embed URL:",
+          processedUrl
+        );
+      } else {
+        console.log("⚠️ Could not extract shortcode from Instagram URL");
       }
+    } else if (isEmbedUrl) {
+      // Convert embed URL to direct post URL
+      processedUrl = processedUrl.replace("/embed/", "/");
+      console.log(
+        "🔄 Converting Instagram embed URL to direct post URL:",
+        processedUrl
+      );
     }
 
     if (
@@ -513,6 +537,7 @@ router.post("/instagram", protect, async (req, res) => {
         processedUrl
       )
     ) {
+      console.log("❌ Invalid Instagram URL format:", processedUrl);
       return res.status(400).json({
         success: false,
         message: "Invalid Instagram URL. Must be a post, reel, or TV URL",
@@ -520,12 +545,16 @@ router.post("/instagram", protect, async (req, res) => {
     }
 
     try {
-      console.log("Attempting to extract Instagram image from:", processedUrl);
+      console.log(
+        "🔍 Attempting to extract Instagram image from:",
+        processedUrl
+      );
 
+      // Add user agent that acts like a normal browser to avoid profile pic issues
       const { data } = await axios.get(processedUrl, {
         headers: {
           "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
           "Accept-Language": "en-US,en;q=0.9",
           Accept:
             "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -544,145 +573,430 @@ router.post("/instagram", protect, async (req, res) => {
         maxRedirects: 5,
       });
 
-      console.log("Successfully fetched Instagram page HTML");
+      console.log("✅ Successfully fetched Instagram page HTML");
 
       let imageUrl = null;
       let extractionMethod = "";
       const $ = cheerio.load(data);
 
-      if (processedUrl.includes("/embed")) {
-        console.log("Processing as embed URL");
-
-        const mainImage =
-          $("img.EmbeddedAsset").attr("src") ||
-          $("img._aa8j").attr("src") ||
-          $("img.FFVAD").attr("src");
-
-        if (mainImage) {
-          imageUrl = mainImage;
-          extractionMethod = "embed_main_image";
-          console.log("Found image in embed main element");
+      // Log all meta tags for debugging
+      console.log("📋 Meta Tags Found:");
+      $("meta").each((i, el) => {
+        const property = $(el).attr("property");
+        const content = $(el).attr("content");
+        if (property && content) {
+          console.log(
+            `  ${property}: ${content.substring(0, 100)}${
+              content.length > 100 ? "..." : ""
+            }`
+          );
         }
+      });
 
-        if (!imageUrl) {
-          const dataSrcImage = $("img[data-src]").attr("data-src");
-          if (dataSrcImage) {
-            imageUrl = dataSrcImage;
-            extractionMethod = "embed_data_src";
-            console.log("Found image in embed data-src attribute");
-          }
+      // Try to extract image URL from meta tags, prioritizing more specific post image tags
+      // Check for post-specific and content-specific meta tags first
+      console.log("🔍 DETAILED DEBUG: Beginning meta tag extraction");
+      console.log("-----------------------------------------------------");
+
+      // Log all image-related meta tags specifically
+      console.log("📸 All image-related meta tags:");
+      const imageTags = [
+        "og:image",
+        "og:image:url",
+        "og:image:secure_url",
+        "twitter:image",
+        "twitter:image:src",
+        "instagram:image",
+        "image",
+        "thumbnail",
+      ];
+
+      const metaImageUrls = {};
+      imageTags.forEach((tag) => {
+        const propContent = $(`meta[property="${tag}"]`).attr("content");
+        const nameContent = $(`meta[name="${tag}"]`).attr("content");
+        if (propContent) {
+          metaImageUrls[`property:${tag}`] = propContent;
+          console.log(
+            `  [property:${tag}] = ${propContent.substring(0, 100)}${
+              propContent.length > 100 ? "..." : ""
+            }`
+          );
         }
+        if (nameContent) {
+          metaImageUrls[`name:${tag}`] = nameContent;
+          console.log(
+            `  [name:${tag}] = ${nameContent.substring(0, 100)}${
+              nameContent.length > 100 ? "..." : ""
+            }`
+          );
+        }
+      });
+
+      // Check for image dimensions in meta tags (useful for filtering out small images)
+      const ogImageWidth = $('meta[property="og:image:width"]').attr("content");
+      const ogImageHeight = $('meta[property="og:image:height"]').attr(
+        "content"
+      );
+      if (ogImageWidth && ogImageHeight) {
+        console.log(
+          `📏 Meta image dimensions: ${ogImageWidth}x${ogImageHeight}`
+        );
       }
 
-      if (!imageUrl) {
-        const dimensionsMatch = data.match(
-          /"dimensions":\s*\{[^}]*"height":(\d+),"width":(\d+)[^}]*\}/
+      imageUrl =
+        $('meta[property="og:image:url"]').attr("content") ||
+        $('meta[property="og:image:secure_url"]').attr("content") ||
+        $('meta[name="twitter:image"]').attr("content") ||
+        $('meta[property="og:image"]').attr("content");
+
+      if (imageUrl) {
+        // Check if the image might be a profile pic rather than a post image
+        const isLikelyProfilePic =
+          imageUrl.includes("/profile_pic/") ||
+          imageUrl.includes("profile_images") ||
+          imageUrl.includes("/dp/") ||
+          (imageUrl.includes("instagram.com") && imageUrl.includes("s150x150"));
+
+        console.log("🔍 PROFILE PIC CHECK: Examining selected image URL");
+        console.log(`📝 Selected URL: ${imageUrl}`);
+        console.log(
+          `🚫 Profile URL patterns: ${
+            isLikelyProfilePic ? "DETECTED" : "None found"
+          }`
         );
-        if (dimensionsMatch) {
+
+        if (isLikelyProfilePic) {
           console.log(
-            `Found image dimensions: ${dimensionsMatch[2]}×${dimensionsMatch[1]}`
+            "⚠️ URL ANALYSIS: This appears to be a profile picture based on URL pattern"
           );
+          // Additional checks to confirm it's a profile pic
+          const profileIndicators = [];
+          if (imageUrl.includes("/profile_pic/"))
+            profileIndicators.push("Contains '/profile_pic/'");
+          if (imageUrl.includes("profile_images"))
+            profileIndicators.push("Contains 'profile_images'");
+          if (imageUrl.includes("/dp/"))
+            profileIndicators.push("Contains '/dp/' (display picture)");
+          if (imageUrl.includes("s150x150"))
+            profileIndicators.push(
+              "Contains 's150x150' (common profile thumbnail size)"
+            );
+          console.log(`🔎 Profile indicators: ${profileIndicators.join(", ")}`);
+        }
 
-          const resourcesMatch = data.match(
-            /"display_resources":\s*\[(.*?)\]/s
+        if (!isLikelyProfilePic) {
+          extractionMethod = "og_image";
+          console.log(
+            "✅ Found image in meta tags:",
+            imageUrl.substring(0, 100) + (imageUrl.length > 100 ? "..." : "")
           );
-          if (resourcesMatch && resourcesMatch[1]) {
-            try {
-              const jsonText = "[" + resourcesMatch[1] + "]";
-              const resources = JSON.parse(jsonText);
+        } else {
+          console.log(
+            "⚠️ Found meta tag image but it appears to be a profile picture, looking for better options:",
+            imageUrl
+          );
+          // Save this as a fallback but continue searching
+          const profileImageUrl = imageUrl;
+          imageUrl = null;
 
-              if (resources && resources.length > 0) {
-                const sorted = resources.sort(
-                  (a, b) =>
-                    b.config_width * b.config_height -
-                    a.config_width * a.config_height
+          // Look for content-specific meta tags
+          const contentTags = [
+            "article:image",
+            "og:image:url",
+            "twitter:image:src",
+            "image",
+            "thumbnail",
+            "instagram:image",
+          ];
+
+          console.log("🔍 DETAILED DEBUG: Searching alternative meta tags");
+          for (const tag of contentTags) {
+            const tagContent =
+              $(`meta[property="${tag}"]`).attr("content") ||
+              $(`meta[name="${tag}"]`).attr("content");
+            if (tagContent) {
+              console.log(
+                `📝 Found [${tag}]: ${tagContent.substring(0, 100)}${
+                  tagContent.length > 100 ? "..." : ""
+                }`
+              );
+
+              const isTagProfilePic =
+                tagContent.includes("/profile_pic/") ||
+                tagContent.includes("profile_images") ||
+                tagContent.includes("/dp/") ||
+                (tagContent.includes("instagram.com") &&
+                  tagContent.includes("s150x150"));
+
+              console.log(
+                `   Profile pic check: ${
+                  isTagProfilePic ? "⚠️ LIKELY PROFILE" : "✅ NOT PROFILE"
+                }`
+              );
+
+              if (tagContent && !isTagProfilePic) {
+                imageUrl = tagContent;
+                extractionMethod = `meta_tag_${tag.replace(":", "_")}`;
+                console.log(
+                  `✅ Found better image in ${tag} meta tag:`,
+                  imageUrl.substring(0, 100) +
+                    (imageUrl.length > 100 ? "..." : "")
+                );
+                break;
+              }
+            }
+          }
+
+          // If no better image found, revert to the profile image as last resort
+          if (!imageUrl) {
+            imageUrl = profileImageUrl;
+            extractionMethod = "og_image_profile";
+            console.log(
+              "⚠️ No better images found, using profile image as fallback"
+            );
+          }
+        }
+      } else {
+        console.log("⚠️ No og:image meta tag found");
+      }
+
+      console.log("-----------------------------------------------------");
+
+      // If no image found in meta tags, try to find it in the HTML content
+      if (!imageUrl) {
+        console.log(
+          "🔍 DETAILED DEBUG: Looking for display_url in HTML content"
+        );
+        console.log("-----------------------------------------------------");
+
+        // Look for display_resources or display_url in JSON data
+        const jsonDataMatches = data.match(
+          /window\._sharedData\s*=\s*({.+?});<\/script>/
+        );
+        if (jsonDataMatches && jsonDataMatches[1]) {
+          try {
+            const jsonData = JSON.parse(jsonDataMatches[1]);
+            console.log("✅ Found Instagram shared data JSON");
+
+            // Dump some structure info for debugging
+            console.log("📊 JSON Structure:");
+            if (jsonData.entry_data) {
+              console.log(
+                "  entry_data keys:",
+                Object.keys(jsonData.entry_data)
+              );
+              if (jsonData.entry_data.PostPage) {
+                console.log("  PostPage found");
+              } else if (jsonData.entry_data.ProfilePage) {
+                console.log(
+                  "  ProfilePage found (this might explain profile pic issues)"
+                );
+              }
+            } else {
+              console.log("  No entry_data found");
+            }
+
+            // Navigate through the JSON structure to find post image
+            let postMedia = null;
+
+            // Try to find media in different possible locations
+            if (
+              jsonData.entry_data &&
+              jsonData.entry_data.PostPage &&
+              jsonData.entry_data.PostPage[0] &&
+              jsonData.entry_data.PostPage[0].graphql &&
+              jsonData.entry_data.PostPage[0].graphql.shortcode_media
+            ) {
+              postMedia =
+                jsonData.entry_data.PostPage[0].graphql.shortcode_media;
+              console.log("✅ Found post media in PostPage structure");
+              console.log(
+                "📊 Media type:",
+                postMedia.is_video ? "VIDEO" : "IMAGE"
+              );
+              if (postMedia.__typename) {
+                console.log("📊 Media typename:", postMedia.__typename);
+              }
+            }
+            // Try alternative structures
+            else if (
+              jsonData.entry_data &&
+              jsonData.entry_data.ProfilePage &&
+              jsonData.entry_data.ProfilePage[0] &&
+              jsonData.entry_data.ProfilePage[0].graphql &&
+              jsonData.entry_data.ProfilePage[0].graphql.user &&
+              jsonData.entry_data.ProfilePage[0].graphql.user
+                .edge_owner_to_timeline_media &&
+              jsonData.entry_data.ProfilePage[0].graphql.user
+                .edge_owner_to_timeline_media.edges &&
+              jsonData.entry_data.ProfilePage[0].graphql.user
+                .edge_owner_to_timeline_media.edges.length > 0
+            ) {
+              postMedia =
+                jsonData.entry_data.ProfilePage[0].graphql.user
+                  .edge_owner_to_timeline_media.edges[0].node;
+              console.log("✅ Found post media in ProfilePage structure");
+              console.log(
+                "⚠️ WARNING: Using ProfilePage might use the wrong image"
+              );
+
+              // Check for profile pic
+              const profilePicUrl =
+                jsonData.entry_data.ProfilePage[0].graphql.user.profile_pic_url;
+              const profilePicUrlHD =
+                jsonData.entry_data.ProfilePage[0].graphql.user
+                  .profile_pic_url_hd;
+              if (profilePicUrl) {
+                console.log("⚠️ Profile pic URL found:", profilePicUrl);
+                console.log("⚠️ Ensure we don't use this by mistake");
+              }
+              if (profilePicUrlHD) {
+                console.log("⚠️ Profile pic URL HD found:", profilePicUrlHD);
+                console.log("⚠️ Ensure we don't use this by mistake");
+              }
+            }
+
+            // Extract the best quality image URL
+            if (postMedia) {
+              console.log("📊 Available media keys:", Object.keys(postMedia));
+
+              // Check for display_resources (contains multiple sizes)
+              if (
+                postMedia.display_resources &&
+                Array.isArray(postMedia.display_resources) &&
+                postMedia.display_resources.length > 0
+              ) {
+                // Sort by size and get the largest
+                const sortedResources = [...postMedia.display_resources].sort(
+                  (a, b) => {
+                    return (
+                      b.config_width * b.config_height -
+                      a.config_width * a.config_height
+                    );
+                  }
                 );
 
-                if (sorted[0] && sorted[0].src) {
-                  imageUrl = sorted[0].src;
-                  extractionMethod = "display_resources";
+                console.log(
+                  "📊 Display resources found:",
+                  postMedia.display_resources.length
+                );
+                postMedia.display_resources.forEach((res, idx) => {
                   console.log(
-                    `Found uncropped image (${sorted[0].config_width}×${sorted[0].config_height})`
+                    `  Resource ${idx + 1}: ${res.config_width}x${
+                      res.config_height
+                    } - ${res.src.substring(0, 100)}...`
+                  );
+                });
+
+                imageUrl = sortedResources[0].src;
+                extractionMethod = "json_display_resources";
+                console.log(
+                  "✅ Found high-quality image in display_resources:",
+                  imageUrl.substring(0, 100) +
+                    (imageUrl.length > 100 ? "..." : "")
+                );
+                console.log(
+                  `📏 Image dimensions: ${sortedResources[0].config_width}x${sortedResources[0].config_height}`
+                );
+              }
+              // Fallback to display_url
+              else if (postMedia.display_url) {
+                imageUrl = postMedia.display_url;
+                extractionMethod = "json_display_url";
+                console.log(
+                  "✅ Found image in display_url:",
+                  imageUrl.substring(0, 100) +
+                    (imageUrl.length > 100 ? "..." : "")
+                );
+
+                // Log dimensions if available
+                if (postMedia.dimensions) {
+                  console.log(
+                    `📏 Image dimensions: ${postMedia.dimensions.width}x${postMedia.dimensions.height}`
                   );
                 }
               }
-            } catch (e) {
-              console.log("Error parsing display_resources:", e.message);
             }
+          } catch (jsonError) {
+            console.error(
+              "❌ Error parsing Instagram JSON data:",
+              jsonError.message
+            );
+            console.error("JSON parse error details:", jsonError);
           }
+        } else {
+          console.log("⚠️ Could not find Instagram shared data JSON");
         }
-      }
 
-      if (!imageUrl) {
-        console.log("Looking for srcset attributes");
-        let largestSrcSetImage = null;
-        let largestWidth = 0;
+        // Fallback: Try simple regex for display_url if JSON parsing failed
+        if (!imageUrl) {
+          console.log("🔍 Attempting fallback: regex search for display_url");
 
-        $("img[srcset]").each((i, el) => {
-          const srcset = $(el).attr("srcset");
-          if (srcset) {
-            const srcsetParts = srcset.split(",");
-            for (const part of srcsetParts) {
-              const [url, widthStr] = part.trim().split(" ");
-              if (url && widthStr) {
-                const width = parseInt(widthStr.replace("w", ""));
-                if (width > largestWidth) {
-                  largestWidth = width;
-                  largestSrcSetImage = url;
-                }
+          const displayUrlRegexes = [
+            /"display_url":"([^"]+)"/,
+            /"display_src":"([^"]+)"/,
+            /"og:image":"([^"]+)"/,
+            /<img[^>]+class="FFVAD"[^>]+src="([^"]+)"/,
+          ];
+
+          for (const regex of displayUrlRegexes) {
+            console.log(`🔍 Trying regex: ${regex}`);
+            const match = data.match(regex);
+            if (match && match[1]) {
+              const potentialUrl = match[1].replace(/\\/g, "");
+              console.log(
+                `📝 Found match: ${potentialUrl.substring(0, 100)}${
+                  potentialUrl.length > 100 ? "..." : ""
+                }`
+              );
+
+              // Skip if it looks like a profile picture
+              const isLikelyProfilePic =
+                potentialUrl.includes("/profile_pic/") ||
+                potentialUrl.includes("profile_images") ||
+                potentialUrl.includes("/dp/");
+
+              console.log(
+                `🚫 Profile URL check: ${
+                  isLikelyProfilePic ? "DETECTED" : "Not detected"
+                }`
+              );
+
+              if (!isLikelyProfilePic) {
+                imageUrl = potentialUrl;
+                extractionMethod = "display_url_regex";
+                console.log(
+                  "✅ Found image in display_url regex:",
+                  imageUrl.substring(0, 100) +
+                    (imageUrl.length > 100 ? "..." : "")
+                );
+                break;
+              } else {
+                console.log(
+                  "⚠️ Skipped profile image found in display_url:",
+                  potentialUrl.substring(0, 100) +
+                    (potentialUrl.length > 100 ? "..." : "")
+                );
               }
             }
           }
-        });
 
-        if (largestSrcSetImage) {
-          imageUrl = largestSrcSetImage;
-          extractionMethod = "srcset_largest";
-          console.log(`Found image in srcset (${largestWidth}w):`, imageUrl);
-        }
-      }
-
-      if (!imageUrl) {
-        const jsonLdMatch = data.match(
-          /<script type="application\/ld\+json">(.*?)<\/script>/s
-        );
-        if (jsonLdMatch && jsonLdMatch[1]) {
-          try {
-            const jsonLD = JSON.parse(jsonLdMatch[1].trim());
-
-            if (jsonLD.image) {
-              if (Array.isArray(jsonLD.image)) {
-                imageUrl = jsonLD.image[0];
-                extractionMethod = "jsonLD_array";
-              } else if (typeof jsonLD.image === "string") {
-                imageUrl = jsonLD.image;
-                extractionMethod = "jsonLD_string";
-              }
-            }
-          } catch (e) {
-            console.log("Error parsing JSON-LD:", e.message);
+          if (!imageUrl) {
+            console.log("⚠️ No display_url found using any regex pattern");
           }
         }
+
+        console.log("-----------------------------------------------------");
       }
 
+      // Try another fallback method - look for image tags with specific patterns
       if (!imageUrl) {
-        const displayUrlMatch = data.match(/"display_url":"([^"]+)"/);
-        if (displayUrlMatch && displayUrlMatch[1]) {
-          imageUrl = displayUrlMatch[1].replace(/\\/g, "");
-          extractionMethod = "display_url";
-          console.log("Found image in display_url");
-        }
-      }
+        console.log("🔍 DETAILED DEBUG: Looking for image tags in HTML");
+        console.log("-----------------------------------------------------");
 
-      if (!imageUrl) {
-        imageUrl = $('meta[property="og:image"]').attr("content");
-        if (imageUrl) {
-          extractionMethod = "og_image";
-          console.log("Fallback to og:image meta tag");
-        }
-      }
-
-      if (!imageUrl) {
+        // First, look for post content images specifically (typically larger images)
+        console.log("❌ Could not find any image URL for the Instagram post");
         return res.status(404).json({
           success: false,
           message: "Could not find image for the Instagram post",
@@ -691,12 +1005,14 @@ router.post("/instagram", protect, async (req, res) => {
 
       if (imageUrl.startsWith("//")) {
         imageUrl = "https:" + imageUrl;
+        console.log("🔄 Added https: prefix to image URL");
       }
 
-      console.log("Original URL:", imageUrl);
+      console.log("🖼️ Original URL:", imageUrl);
       const originalUrl = imageUrl;
 
-      imageUrl = imageUrl
+      // Clean up the URL
+      const cleanedUrl = imageUrl
         .replace(/\/s\d+x\d+\//, "/")
         .replace(/\/c\d+\.\d+\.\d+\.\d+\//, "/")
         .replace(/\/e\d+\//, "/")
@@ -712,33 +1028,248 @@ router.post("/instagram", protect, async (req, res) => {
         .replace(/\?igshid.*$/, "")
         .replace(/\?_nc_.*$/, "");
 
-      imageUrl = imageUrl
+      imageUrl = cleanedUrl
         .replace(/\\u0026/g, "&")
         .replace(/\\u003D/g, "=")
         .replace(/\\/g, "");
 
       if (originalUrl !== imageUrl) {
-        console.log("Transformed URL to remove cropping:", imageUrl);
+        console.log("🔄 Transformed URL to remove cropping:", imageUrl);
       }
 
-      // Verify the image is accessible by making a HEAD request
+      // FINAL PROFILE IMAGE CHECK - Check one more time if this URL has profile image patterns
+      // This is a critical last check to avoid downloading profile images
+      const finalProfileImagePatterns = [
+        "/profile_pic/",
+        "profile_images",
+        "/profpic/",
+        "/pp/",
+        "/dp/",
+        "s150x150",
+        "/profile/",
+        "/profil/",
+        "avatar",
+        ".com/p/profile",
+      ];
+
+      let hasProfilePattern = false;
+      for (const pattern of finalProfileImagePatterns) {
+        if (imageUrl.includes(pattern)) {
+          hasProfilePattern = true;
+          console.log(
+            `⚠️ CRITICAL: Final check detected profile image pattern "${pattern}"`
+          );
+          console.log(`⚠️ URL: ${imageUrl}`);
+
+          // If we're sure this is a profile image, try to get a larger image from the HTML
+          console.log(
+            "🔍 EMERGENCY FALLBACK: Looking for any large image in the page"
+          );
+
+          const imgElements = $("img");
+          const candidateImages = [];
+
+          imgElements.each((i, img) => {
+            const src = $(img).attr("src");
+            if (!src) return;
+
+            // Skip known profile images
+            if (
+              finalProfileImagePatterns.some((pattern) => src.includes(pattern))
+            ) {
+              return;
+            }
+
+            const width = parseInt($(img).attr("width") || "0", 10);
+            const height = parseInt($(img).attr("height") || "0", 10);
+
+            // Only consider Instagram/Facebook CDN images
+            if (src.includes("cdninstagram") || src.includes("fbcdn.net")) {
+              candidateImages.push({
+                src,
+                width,
+                height,
+                size: width * height,
+              });
+            }
+          });
+
+          if (candidateImages.length > 0) {
+            // Sort by size (largest first)
+            candidateImages.sort((a, b) => b.size - a.size);
+
+            console.log(
+              `🔍 Found ${candidateImages.length} alternative images`
+            );
+            candidateImages.forEach((img, idx) => {
+              console.log(
+                `  Alternative ${idx + 1}: ${img.width}x${
+                  img.height
+                } - ${img.src.substring(0, 100)}...`
+              );
+            });
+
+            // Use the largest image
+            imageUrl = candidateImages[0].src;
+            console.log(
+              `✅ EMERGENCY REPLACEMENT: Using alternative image: ${imageUrl.substring(
+                0,
+                100
+              )}...`
+            );
+            extractionMethod = "emergency_fallback";
+            break;
+          }
+        }
+      }
+
+      if (hasProfilePattern && extractionMethod.includes("profile")) {
+        console.log(
+          "⚠️ WARNING: We're about to use what appears to be a profile image. This may not be what you want!"
+        );
+      }
+
+      // Download and upload image to Cloudinary
+      let cloudinaryImageUrl = "";
       try {
-        console.log("Verifying Instagram image accessibility:", imageUrl);
-        await axios.head(imageUrl, {
-          timeout: 5000,
+        console.log("⬇️ Downloading Instagram image from URL:", imageUrl);
+        // Download the image with enhanced headers
+        const response = await axios({
+          method: "GET",
+          url: imageUrl,
+          responseType: "arraybuffer",
           headers: {
             "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+              "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/604.1",
             Referer: "https://www.instagram.com/",
+            Accept: "image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            Origin: "https://www.instagram.com",
           },
+          timeout: 15000,
         });
-        console.log("Instagram image is accessible");
-      } catch (error) {
+
         console.log(
-          "Warning: Instagram image may not be directly accessible:",
-          error.message
+          "✅ Successfully downloaded image, content length:",
+          response.data.length,
+          "bytes"
         );
-        // We'll still try to use it, but we'll note the warning
+        console.log("Content-Type:", response.headers["content-type"]);
+
+        if (!response.data || response.data.length < 1000) {
+          throw new Error("Downloaded image is too small or empty");
+        }
+
+        // Check if the image is a reasonable size for a post (avoid tiny profile pics)
+        const isReasonableSize = response.data.length > 10000; // Most profile pics are smaller than 10KB
+
+        if (!isReasonableSize) {
+          console.log(
+            "⚠️ Downloaded image seems too small for a post image, might be a profile picture"
+          );
+          console.log("🔍 Searching for a better image...");
+
+          // Try to re-extract with a stronger focus on post images
+          // Here we can implement a more aggressive search through the HTML for larger images
+          let betterImageFound = false;
+
+          // Look for "high resolution" or "HD" markers in the HTML
+          const hdImagePattern =
+            /https:\/\/[^"']+?(?:1080x1080|high_resolution|hd|1080p)[^"']+\.(?:jpg|jpeg|png)/i;
+          const hdMatch = data.match(hdImagePattern);
+
+          if (hdMatch && hdMatch[0]) {
+            console.log("✅ Found HD image match:", hdMatch[0]);
+
+            try {
+              // Try to download this better image
+              const hdResponse = await axios({
+                method: "GET",
+                url: hdMatch[0],
+                responseType: "arraybuffer",
+                headers: {
+                  "User-Agent":
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15",
+                  Referer: "https://www.instagram.com/",
+                  Accept: "image/webp,image/apng,image/*,*/*;q=0.8",
+                },
+                timeout: 15000,
+              });
+
+              if (
+                hdResponse.data &&
+                hdResponse.data.length > response.data.length
+              ) {
+                console.log(
+                  "✅ Successfully downloaded better quality image, size:",
+                  hdResponse.data.length,
+                  "bytes"
+                );
+                response.data = hdResponse.data; // Replace with better image
+                betterImageFound = true;
+              }
+            } catch (hdError) {
+              console.error(
+                "❌ Error downloading better quality image:",
+                hdError.message
+              );
+            }
+          }
+
+          if (!betterImageFound) {
+            console.log(
+              "⚠️ Could not find a better image, continuing with the original one"
+            );
+          }
+        }
+
+        // Create a noop function that does nothing for setUploading
+        const noopSetUploading = (state) => {
+          console.log(`📊 Upload state: ${state ? "uploading" : "complete"}`);
+        };
+
+        // Upload to Cloudinary using the buffer directly
+        console.log("☁️ Uploading to Cloudinary...");
+        cloudinaryImageUrl = await uploadFile(
+          Buffer.from(response.data),
+          noopSetUploading
+        );
+
+        console.log(
+          "✅ Successfully uploaded image to Cloudinary:",
+          cloudinaryImageUrl
+        );
+      } catch (uploadError) {
+        console.error("❌ Error uploading image to Cloudinary:", uploadError);
+
+        // Log more details about the error
+        if (uploadError.response) {
+          console.error("Response status:", uploadError.response.status);
+          console.error(
+            "Response headers:",
+            JSON.stringify(uploadError.response.headers, null, 2)
+          );
+        }
+
+        // Try direct URL method as fallback
+        try {
+          console.log("🔄 Trying fallback: direct URL upload to Cloudinary");
+          const noopSetUploading = (state) => {
+            console.log(`📊 Upload state: ${state ? "uploading" : "complete"}`);
+          };
+
+          cloudinaryImageUrl = await uploadFile(imageUrl, noopSetUploading);
+          console.log(
+            "✅ Fallback succeeded, Cloudinary URL:",
+            cloudinaryImageUrl
+          );
+        } catch (fallbackError) {
+          console.error("❌ Fallback upload also failed:", fallbackError);
+          // Fallback to original image URL if both Cloudinary uploads fail
+          console.log("⚠️ Using original Instagram image URL as fallback");
+          cloudinaryImageUrl = imageUrl;
+        }
       }
 
       const originalPostUrl = isEmbedUrl
@@ -746,27 +1277,38 @@ router.post("/instagram", protect, async (req, res) => {
         : processedUrl;
 
       // Create new post using Post model
+      console.log("💾 Creating database record for Instagram post");
       const post = await Post.create({
         user: req.user._id,
         platform: "instagram",
         url: postUrl,
-        imageUrl: imageUrl,
+        imageUrl: cloudinaryImageUrl || imageUrl,
         embedCode: originalEmbedCode,
         title: "",
         description: "",
       });
 
+      console.log("✅ Successfully created Instagram post with ID:", post._id);
+
       return res.status(200).json({
         success: true,
         platform: "instagram",
         url: postUrl,
-        imageUrl: imageUrl,
+        imageUrl: cloudinaryImageUrl || imageUrl,
         extractionMethod: extractionMethod,
         _id: post._id,
         message: "Instagram post image added successfully",
       });
     } catch (error) {
-      console.error("Instagram scraping error:", error);
+      console.error("❌ Instagram scraping error:", error);
+      // Log detailed error information
+      if (error.response) {
+        console.error("Response status:", error.response.status);
+        console.error(
+          "Response headers:",
+          JSON.stringify(error.response.headers, null, 2)
+        );
+      }
       return res.status(404).json({
         success: false,
         message:
@@ -775,7 +1317,7 @@ router.post("/instagram", protect, async (req, res) => {
       });
     }
   } catch (error) {
-    console.error("Instagram API error:", error);
+    console.error("❌ Instagram API error:", error);
     return res.status(500).json({
       success: false,
       message: "Error fetching Instagram image",
@@ -873,6 +1415,7 @@ router.post("/facebook", protect, async (req, res) => {
       });
     }
 
+    // Update regex to better handle share/v/ URLs
     if (
       !/^https?:\/\/(www\.)?(facebook|fb)\.com\/[a-zA-Z0-9.]+\/posts\/|^https?:\/\/(www\.)?(facebook|fb)\.com\/[a-zA-Z0-9.]+\/photos\/|^https?:\/\/(www\.)?(facebook|fb)\.com\/share\/[pv]\/[a-zA-Z0-9_-]+\/?|^https?:\/\/(www\.)?(facebook|fb)\.com\/[a-zA-Z0-9.]+\/videos\/[0-9]+\/?/.test(
         postUrl
@@ -884,6 +1427,9 @@ router.post("/facebook", protect, async (req, res) => {
           "Invalid Facebook URL. Must be a post, photo, video, or share URL",
       });
     }
+
+    // Flag if this is a share/v/ format URL (video share)
+    const isVideoShareUrl = postUrl.includes("/share/v/");
 
     try {
       const headers = {
@@ -909,99 +1455,145 @@ router.post("/facebook", protect, async (req, res) => {
         "sec-ch-ua-platform": '"Windows"',
       };
 
-      console.log("Attempting to fetch Facebook content from:", postUrl);
       const { data } = await axios.get(postUrl, {
-        headers: headers,
+        headers,
         timeout: 15000,
         maxRedirects: 5,
-        validateStatus: function (status) {
-          return status >= 200 && status < 500; // Accept all status codes less than 500
-        },
       });
 
-      console.log("Successfully fetched Facebook page HTML");
+      let imageUrl = null;
+      let extractionMethod = "";
+
+      // Try to extract image URL from meta tags first
       const $ = cheerio.load(data);
 
-      let imageUrl = $('meta[property="og:image"]').attr("content");
-      let extractionMethod = "og_image";
+      // Enhanced meta tag extraction with detailed logging
+      const metaTags = {};
+      $("meta").each((i, meta) => {
+        const property = $(meta).attr("property");
+        const content = $(meta).attr("content");
+        if (property && content) {
+          metaTags[property] = content;
+        }
+      });
 
-      if (!imageUrl) {
-        imageUrl =
-          $('meta[property="og:image:secure_url"]').attr("content") ||
-          $('meta[property="twitter:image"]').attr("content");
-        extractionMethod = "alternative_meta";
+      // Check for video thumbnail specifically
+      if (isVideoShareUrl) {
+        // Try og:image first for videos
+        imageUrl = metaTags["og:image"];
+        if (imageUrl) {
+          extractionMethod = "og_image_video";
+        }
+      } else {
+        // Standard processing for non-video URLs
+        imageUrl = $('meta[property="og:image"]').attr("content");
+        if (imageUrl) {
+          extractionMethod = "og_image";
+        }
       }
 
+      // If no image found in meta tags, try to find it in the HTML content
       if (!imageUrl) {
-        if (postUrl.includes("/share/p/")) {
-          const possibleImages = $("img")
-            .filter(function () {
-              const src = $(this).attr("src");
-              return (
-                src &&
-                (src.includes("fbcdn.net") ||
-                  src.includes("scontent") ||
-                  src.includes("facebook.com/safe_image.php"))
-              );
-            })
-            .map(function () {
-              return $(this).attr("src");
-            })
-            .get();
+        const imgElements = $("img");
 
-          if (possibleImages.length > 0) {
-            imageUrl = possibleImages[0];
-            for (const img of possibleImages) {
-              if (img.includes("_n.") || img.includes("_o.")) {
-                imageUrl = img;
-                break;
-              }
+        for (const img of imgElements) {
+          const src = $(img).attr("src");
+
+          if (src) {
+            if (
+              src.includes("scontent") ||
+              src.includes("fbcdn") ||
+              src.includes("facebook.com/images")
+            ) {
+              imageUrl = src;
+              extractionMethod = "html_content";
+              break;
             }
-            extractionMethod = "html_image";
           }
         }
       }
 
-      if (!imageUrl) {
-        const scripts = $('script[type="application/ld+json"]')
-          .map(function () {
-            return $(this).html();
-          })
-          .get();
+      // For video share URLs, try to find video poster or preview image if still no image
+      if (!imageUrl && isVideoShareUrl) {
+        // Look for video elements
+        const videoElements = $("video");
 
-        for (const script of scripts) {
-          try {
-            const ldJson = JSON.parse(script);
-            if (ldJson.image) {
-              if (Array.isArray(ldJson.image)) {
-                imageUrl = ldJson.image[0];
-              } else {
-                imageUrl = ldJson.image;
+        for (const video of videoElements) {
+          const poster = $(video).attr("poster");
+          if (poster) {
+            imageUrl = poster;
+            extractionMethod = "video_poster";
+            break;
+          }
+        }
+
+        // Look for specific video container elements
+        if (!imageUrl) {
+          $("[data-video-id]").each((i, el) => {
+            const style = $(el).attr("style");
+
+            if (style && style.includes("background-image")) {
+              const bgMatch = style.match(
+                /background-image: ?url\(['"]?([^'")]+)['"]?\)/i
+              );
+              if (bgMatch && bgMatch[1]) {
+                imageUrl = bgMatch[1];
+                extractionMethod = "video_container_bg";
+                return false; // Break each loop
               }
-              extractionMethod = "json_ld";
-              break;
             }
-          } catch (e) {}
+          });
         }
       }
 
+      // If still no image found, try JSON-LD for structured data
+      if (!imageUrl) {
+        $('script[type="application/ld+json"]').each((i, script) => {
+          try {
+            const jsonLd = JSON.parse($(script).html());
+
+            if (jsonLd.image) {
+              if (Array.isArray(jsonLd.image) && jsonLd.image.length > 0) {
+                imageUrl = jsonLd.image[0];
+              } else if (typeof jsonLd.image === "string") {
+                imageUrl = jsonLd.image;
+              }
+
+              if (imageUrl) {
+                extractionMethod = "json_ld";
+              }
+            }
+          } catch (error) {
+            // Silently continue on parse error
+          }
+        });
+      }
+
+      // Last resort: look for any image URL in the HTML that matches Facebook CDN patterns
       if (!imageUrl) {
         const fbcdnPattern =
           /https:\/\/[a-z0-9-]+\.fbcdn\.net\/[a-z0-9_\/.]+\.(?:jpg|jpeg|png|gif)/gi;
         const matches = data.match(fbcdnPattern);
-        if (matches && matches.length > 0) {
-          imageUrl = matches[0];
-          extractionMethod = "regex_match";
-        }
-      }
 
-      if (!imageUrl) {
-        if (postUrl.includes("/share/p/")) {
-          const postIdMatch = postUrl.match(/\/share\/p\/([a-zA-Z0-9_-]+)/);
-          if (postIdMatch && postIdMatch[1]) {
-            imageUrl =
-              "https://static.xx.fbcdn.net/rsrc.php/v3/y4/r/-PAXP-deijE.gif";
-            extractionMethod = "fallback_share";
+        if (matches && matches.length > 0) {
+          // Use the first match that's not a tiny image (profile pics, etc.)
+          for (const match of matches) {
+            // Prefer larger images that don't contain typical small image patterns
+            if (
+              !match.includes("profile") &&
+              !match.includes("_s.") &&
+              !match.includes("emoji")
+            ) {
+              imageUrl = match;
+              extractionMethod = "fbcdn_regex_match";
+              break;
+            }
+          }
+
+          // If we didn't find a preferred image, just use the first one
+          if (!imageUrl && matches.length > 0) {
+            imageUrl = matches[0];
+            extractionMethod = "fbcdn_regex_first_match";
           }
         }
       }
@@ -1009,329 +1601,205 @@ router.post("/facebook", protect, async (req, res) => {
       if (!imageUrl) {
         return res.status(404).json({
           success: false,
-          message:
-            "Could not find image for the Facebook post. This might be due to privacy settings or Facebook's anti-scraping measures.",
+          message: "Could not find image for the Facebook post",
         });
       }
 
-      try {
-        console.log("Verifying Facebook image accessibility:", imageUrl);
-        await axios.head(imageUrl, {
-          timeout: 5000,
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
-            Referer: "https://www.facebook.com/",
-          },
-        });
-        console.log("Facebook image is accessible");
-      } catch (error) {
-        console.log(
-          "Warning: Facebook image may not be directly accessible:",
-          error.message
-        );
+      if (imageUrl.startsWith("//")) {
+        imageUrl = "https:" + imageUrl;
       }
 
-      console.log(`Final Facebook image (via ${extractionMethod}):`, imageUrl);
+      const originalUrl = imageUrl;
 
+      // Clean up the URL
+      imageUrl = imageUrl
+        .replace(/\/s\d+x\d+\//, "/")
+        .replace(/\/c\d+\.\d+\.\d+\.\d+\//, "/")
+        .replace(/\/e\d+\//, "/")
+        .replace(/\/[a-z]\d+x\d+\//, "/")
+        .replace(/\/(vp|p|s)[0-9]+x[0-9]+(_[0-9]+)?\//, "/")
+        .replace(/\/p[0-9]+x[0-9]+\//, "/")
+        .replace(/[\?&]se=\d+/, "")
+        .replace(/[\?&]sh=\d+/, "")
+        .replace(/[\?&]sw=\d+/, "")
+        .replace(/[\?&]quality=\d+/, "")
+        .replace(/\?_nc_ht.*$/, "")
+        .replace(/\?_nc_cat.*$/, "")
+        .replace(/\?igshid.*$/, "")
+        .replace(/\?_nc_.*$/, "");
+
+      // Facebook CDN URLs have anti-hotlinking measures, directly save the URL
+      // instead of trying to download and reupload (which likely results in 403 errors)
+      let cloudinaryImageUrl = "";
+      const fbImageHostnames = ["scontent", "fbcdn", "facebook.com"];
+      const isFacebookCDNImage = fbImageHostnames.some((host) =>
+        imageUrl.includes(host)
+      );
+
+      if (isFacebookCDNImage) {
+        try {
+          // Simple approach: Try to download image with enhanced headers
+          const response = await axios({
+            method: "GET",
+            url: imageUrl,
+            responseType: "arraybuffer",
+            timeout: 15000,
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/604.1",
+              Accept: "image/webp,image/png,image/svg+xml,image/*;q=0.8",
+              "Accept-Language": "en-US,en;q=0.9",
+              Origin: "https://www.facebook.com",
+              Referer: postUrl,
+              "sec-fetch-dest": "image",
+              "sec-fetch-mode": "no-cors",
+              "sec-fetch-site": "cross-site",
+            },
+          });
+
+          if (response.data && response.data.length > 1000) {
+            // Upload to Cloudinary using standard method
+            cloudinaryImageUrl = await uploadFile(
+              Buffer.from(response.data),
+              () => {}
+            );
+          } else {
+            throw new Error(
+              "Facebook image download returned insufficient data"
+            );
+          }
+        } catch (downloadError) {
+          // Fallback to original OG image URL without any modifications
+          if (isVideoShareUrl) {
+            try {
+              // Try downloading the preview image from Facebook
+              // For video content, we use the OG image url directly with no modifications
+              const videoImageUrl = metaTags["og:image"];
+
+              if (videoImageUrl) {
+                const videoResponse = await axios({
+                  method: "GET",
+                  url: videoImageUrl,
+                  responseType: "arraybuffer",
+                  timeout: 15000,
+                  headers: {
+                    "User-Agent":
+                      "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15",
+                    Accept: "image/webp,image/png,image/svg+xml,image/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    Origin: "https://www.facebook.com",
+                    Referer: postUrl,
+                  },
+                });
+
+                if (videoResponse.data && videoResponse.data.length > 1000) {
+                  // Upload to Cloudinary
+                  cloudinaryImageUrl = await uploadFile(
+                    Buffer.from(videoResponse.data),
+                    () => {}
+                  );
+                } else {
+                  throw new Error(
+                    "Video image download returned insufficient data"
+                  );
+                }
+              } else {
+                throw new Error("No OG image URL found for video content");
+              }
+            } catch (videoError) {
+              // If all else fails, use Facebook logo
+              cloudinaryImageUrl =
+                "https://static.xx.fbcdn.net/rsrc.php/v3/y4/r/-PAXP-deijE.gif";
+            }
+          } else {
+            // Non-video content, use original URL
+            cloudinaryImageUrl = imageUrl;
+          }
+        }
+      } else {
+        // For non-Facebook CDN images, try direct download
+        try {
+          // Download the image
+          const response = await axios({
+            method: "GET",
+            url: imageUrl,
+            responseType: "arraybuffer",
+            timeout: 10000,
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+              Referer: "https://www.facebook.com/",
+              Accept: "image/webp,image/apng,image/*,*/*;q=0.8",
+            },
+          });
+
+          // Upload to Cloudinary using the buffer directly
+          cloudinaryImageUrl = await uploadFile(
+            Buffer.from(response.data),
+            () => {}
+          );
+        } catch (uploadError) {
+          // Fallback to original image URL if Cloudinary upload fails
+          cloudinaryImageUrl = imageUrl;
+        }
+      }
+
+      // Create new post using Post model
       const post = await Post.create({
         user: req.user._id,
         platform: "facebook",
         url: postUrl,
-        imageUrl: imageUrl,
-        title: "",
-        description: "",
+        imageUrl: cloudinaryImageUrl || imageUrl,
+        title: metaTags["og:title"] || "",
+        description: metaTags["og:description"] || "",
       });
 
+      // Send the response back to the frontend
       return res.status(200).json({
         success: true,
         platform: "facebook",
         url: postUrl,
-        imageUrl: imageUrl,
-        extractionMethod,
-        message: "Facebook post image added successfully",
+        imageUrl: cloudinaryImageUrl || imageUrl,
+        extractionMethod: extractionMethod,
         _id: post._id,
+        message: "Facebook post image added successfully",
       });
     } catch (error) {
-      console.error("Facebook scraping error:", error);
-      return res.status(404).json({
-        success: false,
-        message:
-          "Error accessing Facebook post. It may be private or not publicly accessible.",
-        error: error.message,
-      });
-    }
-  } catch (error) {
-    console.error("Facebook API error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Error fetching Facebook image",
-      error: error.message,
-    });
-  }
-});
+      // If all methods fail, use a Facebook logo as fallback
+      const fallbackImageUrl =
+        "https://static.xx.fbcdn.net/rsrc.php/v3/y4/r/-PAXP-deijE.gif";
 
-router.post("/tiktok", protect, async (req, res) => {
-  try {
-    const { url: videoUrl } = req.body;
-
-    if (!videoUrl) {
-      return res.status(400).json({
-        success: false,
-        message: "Video URL is required in the request body",
-      });
-    }
-
-    console.log("Processing TikTok URL:", videoUrl);
-
-    // Validate the URL format
-    if (!videoUrl.includes("tiktok.com")) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid TikTok URL. Must be a TikTok video URL",
-      });
-    }
-
-    try {
-      // Use exactly the same API endpoint and approach as the working HTML example
-      console.log(
-        "Fetching TikTok metadata via TikWm API using simplified approach"
-      );
-      const tikwmUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(
-        videoUrl
-      )}`;
-
-      // Make a simple request without excessive headers
-      const response = await axios.get(tikwmUrl);
-      console.log(
-        "TikWm API response received:",
-        JSON.stringify(response.data).substring(0, 500)
-      );
-
-      // Simple validation matching the HTML example
-      if (response.data && response.data.data) {
-        const thumbnailUrl = response.data.data.origin_cover || "";
-        const caption = response.data.data.title || "";
-        const videoId = response.data.data.id || "";
-        const username = response.data.data.author?.unique_id || "";
-        const userImage = response.data.data.author?.avatar || "";
-        const videoPath = response.data.data.wmplay || "";
-
-        console.log("Successfully extracted TikTok data:", {
-          thumbnailUrl,
-          caption,
-          username,
-          userImage,
-          videoPath,
-        });
-
-        // Download and upload thumbnail to Cloudinary
-        let cloudinaryThumbnailUrl = "";
-        let cloudinaryUserImageUrl = "";
-        if (thumbnailUrl) {
-          try {
-            // Download the image
-            const response = await axios({
-              method: "GET",
-              url: thumbnailUrl,
-              responseType: "arraybuffer",
-            });
-
-            // Upload to Cloudinary using the buffer directly
-            cloudinaryThumbnailUrl = await uploadFile(
-              Buffer.from(response.data),
-              () => {}
-            );
-
-            console.log(
-              "Successfully uploaded thumbnail to Cloudinary:",
-              cloudinaryThumbnailUrl
-            );
-          } catch (uploadError) {
-            console.error(
-              "Error uploading thumbnail to Cloudinary:",
-              uploadError
-            );
-            // Fallback to original thumbnail URL if Cloudinary upload fails
-            cloudinaryThumbnailUrl = thumbnailUrl;
-          }
-        }
-
-        // Upload userImage to Cloudinary if available
-        if (userImage) {
-          try {
-            // Download the image
-            const response = await axios({
-              method: "GET",
-              url: userImage,
-              responseType: "arraybuffer",
-            });
-
-            // Upload to Cloudinary using the buffer directly
-            cloudinaryUserImageUrl = await uploadFile(
-              Buffer.from(response.data),
-              () => {}
-            );
-
-            console.log(
-              "Successfully uploaded user image to Cloudinary:",
-              cloudinaryUserImageUrl
-            );
-          } catch (uploadError) {
-            console.error(
-              "Error uploading user image to Cloudinary:",
-              uploadError
-            );
-            // Fallback to original userImage URL if Cloudinary upload fails
-            cloudinaryUserImageUrl = userImage;
-          }
-        }
-
-        // Create new post using Post model
+      try {
         const post = await Post.create({
           user: req.user._id,
-          platform: "tiktok",
-          url: videoUrl,
-          thumbnailUrl: cloudinaryThumbnailUrl || thumbnailUrl,
-          caption: caption,
-          videoId: videoId,
-          username: username,
-          userImage: cloudinaryUserImageUrl || userImage,
-          videoPath: videoPath,
-          title: caption || "",
+          platform: "facebook",
+          url: postUrl,
+          imageUrl: fallbackImageUrl,
+          title: "",
           description: "",
         });
 
         return res.status(200).json({
           success: true,
-          platform: "tiktok",
-          url: videoUrl,
-          thumbnailUrl: cloudinaryThumbnailUrl || thumbnailUrl,
-          title: caption,
-          videoId: videoId,
-          username: username,
-          userImage: cloudinaryUserImageUrl || userImage,
-          videoPath: videoPath,
-          extractionMethod: "tikwm_api_simplified",
-          message: "TikTok video added successfully",
+          platform: "facebook",
+          url: postUrl,
+          imageUrl: fallbackImageUrl,
+          extractionMethod: "fallback_logo",
           _id: post._id,
+          message: "Facebook post added with fallback image",
         });
-      } else {
-        throw new Error("Invalid response format from TikWm API");
-      }
-    } catch (error) {
-      console.error("TikTok API error:", error);
-
-      // Fallback to Open Graph method
-      try {
-        console.log(
-          "Trying alternative TikTok metadata extraction method (Open Graph)"
-        );
-
-        // Fetch the TikTok page directly
-        const { data: tiktokPageData } = await axios.get(videoUrl, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-          },
-          timeout: 10000,
+      } catch (fallbackError) {
+        return res.status(500).json({
+          success: false,
+          message: "Error creating Facebook post",
+          error: fallbackError.message,
         });
-
-        // Try to extract thumbnail from Open Graph meta tags
-        const $ = cheerio.load(tiktokPageData);
-        let thumbnailUrl = $('meta[property="og:image"]').attr("content");
-        let caption =
-          $('meta[property="og:description"]').attr("content") || "";
-
-        let cloudinaryThumbnailUrl = "";
-        if (thumbnailUrl) {
-          try {
-            // Download the image
-            const response = await axios({
-              method: "GET",
-              url: thumbnailUrl,
-              responseType: "arraybuffer",
-            });
-
-            // Upload to Cloudinary using the buffer directly
-            cloudinaryThumbnailUrl = await uploadFile(
-              Buffer.from(response.data),
-              () => {}
-            );
-
-            console.log(
-              "Successfully uploaded thumbnail to Cloudinary:",
-              cloudinaryThumbnailUrl
-            );
-          } catch (uploadError) {
-            console.error(
-              "Error uploading thumbnail to Cloudinary:",
-              uploadError
-            );
-            // Fallback to original thumbnail URL if Cloudinary upload fails
-            cloudinaryThumbnailUrl = thumbnailUrl;
-          }
-        }
-
-        if (thumbnailUrl) {
-          console.log(
-            "Successfully extracted thumbnail via Open Graph tags:",
-            thumbnailUrl
-          );
-
-          // Create new post using Post model
-          const post = await Post.create({
-            user: req.user._id,
-            platform: "tiktok",
-            url: videoUrl,
-            thumbnailUrl: cloudinaryThumbnailUrl || thumbnailUrl,
-            caption: caption,
-          });
-
-          return res.status(200).json({
-            success: true,
-            platform: "tiktok",
-            url: videoUrl,
-            thumbnailUrl: cloudinaryThumbnailUrl || thumbnailUrl,
-            caption: caption,
-            extractionMethod: "opengraph",
-            message: "TikTok video added successfully with OG tags",
-          });
-        }
-      } catch (alternativeError) {
-        console.error(
-          "Alternative TikTok extraction method failed:",
-          alternativeError
-        );
       }
-
-      // Fallback to logo if all else fails
-      const fallbackThumbnail =
-        "https://sf16-sg.tiktokcdn.com/obj/eden-sg/uvkuhyieh7lpqegw/tiktok_logo.png";
-
-      // Create new post using Post model with fallback image
-      const post = await Post.create({
-        user: req.user._id,
-        platform: "tiktok",
-        url: videoUrl,
-        thumbnailUrl: fallbackThumbnail,
-      });
-
-      // We still return success, just with the fallback image
-      return res.status(200).json({
-        success: true,
-        platform: "tiktok",
-        url: videoUrl,
-        thumbnailUrl: fallbackThumbnail,
-        extractionMethod: "fallback_logo",
-        message: "TikTok video added with fallback image",
-      });
     }
   } catch (error) {
-    console.error("TikTok processing error:", error);
     return res.status(500).json({
       success: false,
-      message: "Error processing TikTok video",
+      message: "Error fetching Facebook image",
       error: error.message,
     });
   }
@@ -2428,6 +2896,83 @@ router.post("/post/update-details", protect, async (req, res) => {
       success: false,
       message: "Error updating post details",
       error: error.message,
+    });
+  }
+});
+
+// Add a test route for Cloudinary configuration
+router.get("/cloudinary-test", protect, async (req, res) => {
+  try {
+    console.log("📊 Testing Cloudinary configuration");
+
+    // Check if environment variables are set
+    const apiKey = process.env.CLOUDINARY_API_KEY;
+    const apiSecret = process.env.CLOUDINARY_API_SECRET;
+
+    if (!apiKey || !apiSecret) {
+      console.error("❌ Cloudinary credentials missing in environment");
+      return res.status(500).json({
+        success: false,
+        message: "Cloudinary configuration incomplete - missing credentials",
+        details: {
+          api_key_present: !!apiKey,
+          api_secret_present: !!apiSecret,
+        },
+      });
+    }
+
+    // Test Cloudinary connectivity with a ping
+    const pingResult = await cloudinary.api.ping();
+
+    // Try to upload a test image to verify full access
+    // Create a simple 1x1 pixel transparent PNG as base64
+    const testImageBase64 =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
+    const uploadResult = await cloudinary.uploader.upload(testImageBase64, {
+      folder: "shoplinkify-test",
+      public_id: "connectivity-test",
+      overwrite: true,
+    });
+
+    // If we get here, the upload was successful
+    console.log("✅ Cloudinary test successful!");
+
+    return res.status(200).json({
+      success: true,
+      message: "Cloudinary is properly configured and working",
+      details: {
+        ping: pingResult,
+        upload_test: {
+          url: uploadResult.secure_url,
+          public_id: uploadResult.public_id,
+        },
+        config: {
+          cloud_name: "dexeo4ce2",
+          api_key_present: !!apiKey,
+          api_secret_present: !!apiSecret,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("❌ Cloudinary test failed:", error);
+
+    let errorDetails = {
+      message: error.message,
+    };
+
+    if (error.http_code) {
+      errorDetails.http_code = error.http_code;
+    }
+
+    if (error.response) {
+      errorDetails.response = error.response.data || "See server logs";
+    }
+
+    return res.status(500).json({
+      success: false,
+      message: "Cloudinary configuration test failed",
+      error: errorDetails,
     });
   }
 });
